@@ -1,0 +1,7 @@
+# 【修改】键名与 Prompt_loader.py 保持一致：
+# main_prompt_path → main_prompts_path（load_system_prompts 读取）
+# rag_summarize_prompt 路径 prompt/ → prompts/（文件夹名写错会导致读不到文件）
+# report_prompt_path → report_prompts_path，文件名对应 prompts/report_prompts.txt（load_report_prompts 读取）
+main_prompts_path: prompts/main_prompt.txt
+rag_summarize_prompt: prompts/rag_summarize.txt
+report_prompts_path: prompts/report_prompts.txt

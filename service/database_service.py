@@ -4,6 +4,7 @@
 #选型说明：SQLite 零配置、单文件、Python 标准库自带 sqlite3，适合本地单进程应用；
 #表结构按 1个用户:N笔购买、1笔购买:N条维修 的一对多关系设计，外键开启级联删除，
 #删除用户时其购买与维修记录一并清理。
+import bcrypt
 import csv
 import hashlib
 import os
@@ -18,7 +19,10 @@ from utils.config_handler import agent_config
 from utils.path_tool import get_abs_path
 from utils.logger_handler import logger
 
-#密码加盐哈希（演示级：固定盐 + sha256；生产环境应使用 bcrypt/argon2 等慢哈希防暴力破解）
+#【修改】密码哈希由"固定盐 + sha256"升级为 bcrypt：
+#原方案是单轮快哈希（GPU 每秒可尝试数十亿次），且盐硬编码在源码中；
+#bcrypt 自带随机盐、工作因子可调，专为抗离线暴力破解设计。
+#_PASSWORD_SALT 仅保留用于校验历史遗留的 sha256 哈希（登录成功后自动升级为 bcrypt）。
 _PASSWORD_SALT = "aftersales-salt"
 
 #建表语句：三张表，外键声明 ON DELETE CASCADE 配合 PRAGMA foreign_keys 实现级联删除
@@ -51,8 +55,18 @@ CREATE TABLE IF NOT EXISTS reports (
 
 
 def _hash_password(password: str) -> str:
-    """密码哈希：入库前加盐摘要，数据库中不保存明文密码"""
-    return hashlib.sha256((_PASSWORD_SALT + password).encode("utf-8")).hexdigest()
+    """密码哈希：bcrypt（自带随机盐）；按 72 字节截断（bcrypt 算法输入上限）"""
+    return bcrypt.hashpw(password.encode("utf-8")[:72], bcrypt.gensalt()).decode("utf-8")
+
+
+def _verify_password(password: str, stored: str) -> bool:
+    """校验密码：兼容 bcrypt（$2 前缀）与历史 sha256 十六进制两种存储格式"""
+    if stored.startswith("$2"):
+        try:
+            return bcrypt.checkpw(password.encode("utf-8")[:72], stored.encode("utf-8"))
+        except ValueError:
+            return False
+    return stored == hashlib.sha256((_PASSWORD_SALT + password).encode("utf-8")).hexdigest()
 
 
 class DatabaseService:
@@ -63,15 +77,17 @@ class DatabaseService:
     - 初始化失败时置 self.error，供 ExternalRecordService 判断"数据源故障"
     """
 
-    def __init__(self, db_path: str | None = None) -> None:
-        #数据库文件路径默认取配置文件，也允许测试时传入其他路径
+    def __init__(self, db_path: str | None = None, import_seed: bool = True) -> None:
+        #数据库文件路径默认取配置文件，也允许测试时传入其他路径；
+        #import_seed=False 跳过 CSV 初始导入（测试用：避免每个用例重复 bcrypt 哈希 170+ 个用户）
         self._db_path = db_path or get_abs_path(agent_config["database_path"])
         self.error: str | None = None   #初始化失败时置错误信息；None 表示数据源正常
         try:
             #确保数据库文件所在目录存在，再建表、按需导入 CSV
             os.makedirs(os.path.dirname(self._db_path), exist_ok=True)
             self._init_schema()
-            self._import_from_csv_if_empty()
+            if import_seed:
+                self._import_from_csv_if_empty()
         except sqlite3.Error as e:
             logger.error(f"[数据库]初始化失败：{str(e)}")
             self.error = f"数据库初始化失败：{str(e)}"
@@ -192,10 +208,18 @@ class DatabaseService:
     # ---------------- 用户表 CRUD ----------------
 
     def verify_user(self, user_id: str, password: str) -> bool:
-        """登录校验：用户存在且密码匹配返回 True，其余情况一律 False"""
+        """登录校验：用户存在且密码匹配返回 True，其余情况一律 False。
+
+        【新增】惰性迁移：历史用户存的是 sha256 哈希，校验通过后顺手改写为 bcrypt——
+        存量账号无需重置密码、无需停机迁移，谁登录谁升级。
+        """
         with self._tx() as conn:
             row = conn.execute("SELECT 密码 FROM users WHERE 用户ID = ?", (user_id,)).fetchone()
-        return row is not None and row["密码"] == _hash_password(password)
+        if row is None or not _verify_password(password, row["密码"]):
+            return False
+        if not row["密码"].startswith("$2"):   #旧格式哈希：登录成功即升级为 bcrypt
+            self.update_password(user_id, password)
+        return True
 
     def create_user(self, user_id: str, password: str) -> None:
         """新增用户（密码不限长度、不做格式限制）；用户已存在抛 ValueError"""

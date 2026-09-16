@@ -2,9 +2,14 @@
 #【新增】FastAPI 单文件应用：内嵌聊天页面（HTML/CSS/JS）+ SSE 流式聊天接口
 #运行方式：cd 项目根 && .venv/Scripts/python.exe app.py，浏览器访问 http://127.0.0.1:8618
 #【修改】端口由 8000 改为 8618：8000 被系统进程占用且在 Windows 排除端口范围（winerror 10013）
-#接口：
-#  GET  /          返回聊天页面
-#  POST /api/chat  请求体 {"query": "..."}，SSE 流式返回事件：
+#接口（【修改】除首页/登录/注册外，业务接口一律要求 Authorization: Bearer <token>，
+#身份由服务端从 token 解析——原实现信任请求体 user_id，存在越权漏洞）：
+#  GET  /            返回聊天页面
+#  POST /api/login   登录成功返回 {"ok":true,"user_id":...,"token":...}（JWT，2小时有效）；
+#                    同一 (用户ID, IP) 5 分钟内失败满 5 次锁定 15 分钟（防爆破）
+#  POST /api/register 注册：系统分配4位用户ID（密码至少6位）
+#  POST /api/report  售后上报（身份取自 token）
+#  POST /api/chat    请求体 {"query": "...", "session_id": "..."}，SSE 流式返回事件：
 #                  data: {"type":"tool","id":...,"content":...}  工具调用开始（显示为状态条）
 #                  data: {"type":"tool_done","id":...}            工具执行完成（状态条变完成态）
 #                  data: {"type":"text","content":...}  模型回答 token 分片（前端逐字渐现）
@@ -13,13 +18,15 @@
 import json
 import re
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 from langchain_core.messages import AIMessageChunk, ToolMessage
 
 from agent.react_agent import ReactAgent
+from service.auth_service import create_token, get_current_user
 from service.database_service import get_database_service
+from service.login_guard import get_login_guard
 from service.session_memory_service import get_session_memory_service
 from utils.logger_handler import logger
 
@@ -53,9 +60,8 @@ class ChatRequest(BaseModel):
     #会话ID：前端每个标签页生成一个（crypto.randomUUID），后端据此维护临时对话历史；
     #留空则不启用会话记忆（兼容直接发 {"query": "..."} 的旧前端）
     session_id: str = ""
-    #登录用户ID：注入运行时上下文，工具查询使用记录/保修时默认绑定该用户（防越权）；
-    #留空表示未登录，数据查询退回"由模型索要ID"的旧行为
-    user_id: str = ""
+    #【修改】原 user_id 字段已删除：用户身份改由 Authorization: Bearer <token> 提供
+    #（见 get_current_user 依赖）——请求体自报身份正是越权漏洞的根源
 
 def stream_events(query: str, session_id: str = "", user_id: str = ""):
     """以事件字典迭代 Agent 流式输出：区分工具调用状态与回答文本。
@@ -79,8 +85,11 @@ def stream_events(query: str, session_id: str = "", user_id: str = ""):
     """
     agent = get_agent()
     memory = get_session_memory_service()
+    #【修改】会话记忆按"登录用户 + 会话ID"隔离：原实现只认前端生成的 session_id，
+    #拿到他人 session_id 即可续读其对话历史；加用户前缀后不同用户天然隔离
+    mem_key = f"{user_id}:{session_id}" if session_id else ""
     #历史消息 + 本次问题拼成完整输入；session_id 为空（旧前端）则退化为无记忆单轮问答
-    history = memory.get_history(session_id) if session_id else []
+    history = memory.get_history(mem_key) if mem_key else []
     input_dict = {"messages": [*history, {"role": "user", "content": query}]}
     seen_tool_indices: set = set()   #记录已上报过的工具调用序号，避免一个调用报多次
     seen_tool_done_ids: set = set()  #记录已下发 tool_done 的 tool_call_id，避免工具返回分片时重复下发
@@ -165,22 +174,22 @@ def stream_events(query: str, session_id: str = "", user_id: str = ""):
     else:
         #【新增】整段对话正常结束才写入记忆：出错或前端中断（GeneratorExit）时不保存，
         #避免把没有回答的半截对话留给下一轮；无最终回答文本同样不保存
-        if answer_parts and session_id:
-            memory.append_message(session_id, "user", query)
+        if answer_parts and mem_key:
+            memory.append_message(mem_key, "user", query)
             #多段文本直接拼接为一条助手消息（正常流程只有最终回答这一段）
-            memory.append_message(session_id, "assistant", "".join(answer_parts))
+            memory.append_message(mem_key, "assistant", "".join(answer_parts))
 
 class LoginRequest(BaseModel):
     user_id: str
     password: str
 
 @app.post("/api/login")
-def login(payload: LoginRequest):
+def login(payload: LoginRequest, request: Request):
     """登录校验接口。
 
-    用户ID必须是4位数字（与数据格式一致）；密码不限长度、不做格式限制，
-    只校验是否与数据库中的密码匹配（演示数据默认密码 1111）。
-    校验通过返回 {"ok": true, "user_id": ...}；失败返回中文提示。
+    用户ID必须是4位数字（与数据格式一致）；密码只校验是否与数据库中的密码匹配。
+    【修改】① 校验通过签发 JWT（随响应返回 token），后续业务接口凭 token 识别身份；
+    ② 接入登录护栏：同一 (用户ID, IP) 5 分钟内失败满 5 次锁定 15 分钟，防暴力枚举。
     """
     user_id = payload.user_id.strip()
     password = payload.password
@@ -189,8 +198,17 @@ def login(payload: LoginRequest):
     #密码不限制长度，仅要求非空
     if not password:
         return {"ok": False, "message": "密码不能为空"}
+    #防爆破：先查锁定状态（未锁定返回 0）
+    client_ip = request.client.host if request.client else "unknown"
+    guard = get_login_guard()
+    locked_seconds = guard.check(user_id, client_ip)
+    if locked_seconds:
+        logger.warning(f"[web]登录已锁定：{user_id}@{client_ip}，剩余 {locked_seconds}s")
+        return {"ok": False, "message": f"尝试过于频繁，请 {locked_seconds} 秒后再试"}
     if get_database_service().verify_user(user_id, password):
-        return {"ok": True, "user_id": user_id}
+        guard.reset(user_id, client_ip)
+        return {"ok": True, "user_id": user_id, "token": create_token(user_id)}
+    guard.record_failure(user_id, client_ip)
     return {"ok": False, "message": "用户不存在或密码错误"}
 
 class RegisterRequest(BaseModel):
@@ -200,12 +218,15 @@ class RegisterRequest(BaseModel):
 def register(payload: RegisterRequest):
     """注册接口：系统随机分配一个未被占用的4位用户ID，密码由用户设置。
 
-    密码不限长度、不做格式限制，仅要求非空；
+    密码要求至少 6 位（【修改】原实现仅要求非空，1 位密码配合4位ID极易被穷举）；
     成功返回 {"ok": true, "user_id": ...}；失败返回中文提示。
     """
     password = payload.password
     if not password:
         return {"ok": False, "message": "密码不能为空"}
+    #【新增】最小长度校验
+    if len(password) < 6:
+        return {"ok": False, "message": "密码长度至少 6 位"}
     try:
         user_id = get_database_service().create_user_auto(password)
     except (RuntimeError, ValueError) as e:
@@ -214,22 +235,19 @@ def register(payload: RegisterRequest):
     return {"ok": True, "user_id": user_id}
 
 class ReportRequest(BaseModel):
-    user_id: str
+    #【修改】user_id 字段已删除：身份取自 Authorization: Bearer <token>
     device_type: str
     fault: str
 
 @app.post("/api/report")
-def report(payload: ReportRequest):
+def report(payload: ReportRequest, user_id: str = Depends(get_current_user)):
     """售后上报接口：用户选择外设类型并填写故障描述，上报时间由服务器自动记录。
 
-    校验：用户ID为4位数字且存在、外设类型在白名单内、故障描述非空；
+    身份来自登录 token（不再信任请求体）；保留外设类型白名单与故障描述非空校验；
     成功返回 {"ok": true, "report_id": ..., "time": ...}（time 为服务器记录的上报时间）。
     """
-    user_id = payload.user_id.strip()
     device_type = payload.device_type.strip()
     fault = payload.fault.strip()
-    if not re.fullmatch(r"\d{4}", user_id):
-        return {"ok": False, "message": "用户ID应为4位数字"}
     if device_type not in _ALLOWED_DEVICE_TYPES:
         return {"ok": False, "message": "外设类型无效"}
     if not fault:
@@ -243,14 +261,14 @@ def report(payload: ReportRequest):
     return {"ok": True, "report_id": report_id, "time": record["上报时间"]}
 
 @app.post("/api/chat")
-def chat(payload: ChatRequest):
-    """SSE 流式聊天接口"""
+def chat(payload: ChatRequest, user_id: str = Depends(get_current_user)):
+    """SSE 流式聊天接口（身份取自登录 token）"""
     query = payload.query.strip()
     if not query:
         return StreamingResponse(iter([]), media_type="text/event-stream")
 
     def gen():
-        for event in stream_events(query, payload.session_id, payload.user_id):
+        for event in stream_events(query, payload.session_id, user_id):
             yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
         yield 'data: {"type": "done"}\n\n'
 
@@ -500,14 +518,14 @@ PAGE_HTML = """<!DOCTYPE html>
     <div class="login-card">
       <div class="logo">🎧</div>
       <h2>外设售后小助手</h2>
-      <p class="tip">请先登录（老用户默认密码 1111），新用户点击下方注册</p>
+      <p class="tip">请先登录，新用户点击下方注册</p>
       <div id="login-form">
         <input id="login-id" type="text" placeholder="用户ID（4位数字，如 2483）" autocomplete="off">
         <input id="login-pwd" type="password" placeholder="密码" autocomplete="off">
         <button id="login-btn">登 录</button>
       </div>
       <div id="register-form" style="display:none">
-        <input id="reg-pwd" type="password" placeholder="设置密码（不限长度）" autocomplete="off">
+        <input id="reg-pwd" type="password" placeholder="设置密码（至少6位）" autocomplete="off">
         <input id="reg-pwd2" type="password" placeholder="再次输入密码" autocomplete="off">
         <button id="register-btn">注 册</button>
       </div>
@@ -571,6 +589,11 @@ const loginBtn = document.getElementById('login-btn');
 const loginErr = document.getElementById('login-err');
 const logoutBtn = document.getElementById('logout');
 let loggedUser = null;   //已登录的用户ID，未登录为 null
+let authToken = null;    //【新增】登录签发的 JWT，仅存内存（刷新页面需重新登录）
+//【新增】带身份凭证的请求头：业务接口（chat/report）一律携带 Bearer token
+function authHeaders() {
+  return { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + authToken };
+}
 
 async function doLogin() {
   loginErr.className = 'login-err';
@@ -587,6 +610,7 @@ async function doLogin() {
     const data = await res.json();
     if (data.ok) {
       loggedUser = data.user_id;
+      authToken = data.token || null;              //【新增】保存服务端签发的登录凭证
       loginScreen.style.display = 'none';          //登录成功：撤掉浮层，进入聊天界面
       logoutBtn.style.display = '';                //恢复 CSS 默认展示（.status 样式）
       logoutBtn.textContent = '已登录 ' + loggedUser + ' · 退出';
@@ -610,6 +634,7 @@ loginPwd.addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); })
 //退出登录：回到登录浮层，换新会话ID并清空聊天记录
 logoutBtn.addEventListener('click', () => {
   loggedUser = null;
+  authToken = null;                              //【新增】清除登录凭证
   logoutBtn.style.display = 'none';
   loginScreen.style.display = 'flex';
   sessionId = crypto.randomUUID();
@@ -652,6 +677,7 @@ async function doRegister() {
   const password = regPwd.value;
   const password2 = regPwd2.value;
   if (!password) { loginErr.textContent = '密码不能为空'; return; }
+  if (password.length < 6) { loginErr.textContent = '密码长度至少 6 位'; return; }
   if (password !== password2) { loginErr.textContent = '两次输入的密码不一致'; return; }
   registerBtn.disabled = true;
   try {
@@ -715,9 +741,11 @@ reportSubmit.addEventListener('click', async () => {
   try {
     const res = await fetch('/api/report', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ user_id: loggedUser, device_type, fault }),
+      headers: authHeaders(),
+      //【修改】身份不再放请求体：user_id 由服务端从 Authorization 头解析
+      body: JSON.stringify({ device_type, fault }),
     });
+    if (res.status === 401) { handleAuthExpired('登录已过期，请重新登录'); return; }
     const data = await res.json();
     if (data.ok) {
       //上报成功：关闭上报弹窗，弹出独立的成功提示页（不在弹窗内提示）
@@ -815,6 +843,21 @@ function addError(text) {
   scrollToBottom();
 }
 
+//【新增】登录凭证失效（401）：退回登录浮层并提示重新登录
+function handleAuthExpired(message) {
+  loggedUser = null;
+  authToken = null;
+  logoutBtn.style.display = 'none';
+  sessionId = crypto.randomUUID();
+  chat.innerHTML = '';
+  const fresh = addBotMsg(false);
+  fresh.textContent = WELCOME_TEXT;
+  loginScreen.style.display = 'flex';
+  loginErr.className = 'login-err';
+  loginErr.textContent = message || '登录已过期，请重新登录';
+  loginId.focus();
+}
+
 async function send(query) {
   if (!query.trim()) return;
   addUserMsg(query);
@@ -827,9 +870,11 @@ async function send(query) {
   try {
     const res = await fetch('/api/chat', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query, session_id: sessionId, user_id: loggedUser }),
+      headers: authHeaders(),
+      //【修改】身份不再放请求体：user_id 由服务端从 Authorization 头解析
+      body: JSON.stringify({ query, session_id: sessionId }),
     });
+    if (res.status === 401) { handleAuthExpired('登录已过期，请重新登录'); return; }
     if (!res.ok || !res.body) throw new Error('HTTP ' + res.status);
 
     const reader = res.body.getReader();
@@ -910,6 +955,10 @@ document.getElementById('new-chat').addEventListener('click', () => {
 """
 
 if __name__ == "__main__":
+    import os
+
     import uvicorn
     #host 绑定 127.0.0.1 仅本机访问，如需局域网演示可改为 0.0.0.0
-    uvicorn.run(app, host="127.0.0.1", port=8618)
+    #【新增】端口可用环境变量 APP_PORT 覆盖（默认 8618），便于与原目录的旧服务同时运行
+    port = int(os.getenv("APP_PORT", "8618"))
+    uvicorn.run(app, host="127.0.0.1", port=port)

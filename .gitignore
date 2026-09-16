@@ -1,0 +1,19 @@
+#虚拟环境与缓存（体积大、可重建）
+.venv/
+__pycache__/
+*.pyc
+
+#IDE 配置
+.idea/
+.vscode/
+
+#运行时产物
+logs/
+faiss.db/
+md5.text
+
+#SQLite 数据库（首次启动由 data/external/records.csv 自动导入生成）
+*.db
+
+#本地敏感配置（含密钥）
+.env

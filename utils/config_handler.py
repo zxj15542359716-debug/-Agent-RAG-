@@ -1,6 +1,25 @@
 """通过K读取V，K就是文件，V就是配置文件中的对象"""
+import os
+
 import yaml
+from dotenv import load_dotenv
+
 from utils.path_tool import get_abs_path
+
+#【新增】加载项目根目录的 .env（不存在则静默跳过；已存在于系统环境变量中的值优先，
+#不会被 .env 覆盖）。JWT_SECRET 等本地敏感配置放 .env，避免硬编码进源码。
+load_dotenv(get_abs_path(".env"))
+
+
+def require_env(name: str) -> str:
+    """读取必需的环境变量；缺失时抛错（fail-fast：配置问题在启动阶段暴露，
+    而不是服务照常启动、用户请求时才失败）"""
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(
+            f"缺少必需的环境变量 {name}。请在项目根目录的 .env 文件"
+            f"（可从 .env.example 复制）或系统环境变量中配置后重启。")
+    return value
 
 #rag文件
 def load_rag_config(configer_path:str = get_abs_path("config/rag.yml"),encoding:str="utf-8"):

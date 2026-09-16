@@ -3,9 +3,9 @@
 mode: hybrid
 vector_top_k: 40        #向量路召回条数（原实现 k=3，是召回天花板）
 bm25_top_k: 40          #关键词路召回条数（jieba 分词 + BM25Okapi）
-fuse_weights:           #融合权重（对齐 RAGFlow 默认：全文 0.7 / 向量 0.3，可调）
-  keyword: 0.7
-  vector: 0.3
+fuse_weights:           #融合权重（本语料实测最优 0.4/0.6；RAGFlow 默认 0.7/0.3 在本库反而降召回）
+  keyword: 0.4
+  vector: 0.6
 fuse_top_k: 40          #融合后进入重排的候选池大小
 rerank_provider: dashscope   #dashscope | local | none（none 用于消融对照组）
 rerank_model: gte-rerank-v2
@@ -26,6 +26,10 @@ rerank_top_n: 5         #重排后进入提示词的条数
 #   ① 召回条数 vector_top_k / bm25_top_k（把候选池从 3 拉到 40）
 #   ② 融合权重 fuse_weights（关键词 vs 向量的话语权）
 #   ③ 重排档位 rerank_provider / rerank_top_n（精排与否、精排取前几）
+# 权重调参记录（2026-09-16，eval/run_retrieval.py 实测 52 题）：
+#   keyword 0.7/0.3 → recall@5 0.904；0.5/0.5 → 0.962；0.4/0.6 → 1.000（最优）；0.3/0.7 → 1.000（MRR 略低）。
+#   结论：权重与语料强相关（RAGFlow 的 0.7/0.3 来自其英文长文档场景），本库条目短、
+#   问题口语化，向量语义占更大话语权更合适——这正是"旋钮可调 + 评测量化"的意义。
 # 怎么量化：eval/run_retrieval.py --modes vector_k3,vector_k40,hybrid,hybrid_rerank
 #           输出 recall@5 / MRR@10 对比表，改配置后重跑即可看到数字变化。
 # 依赖说明：

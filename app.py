@@ -13,6 +13,7 @@
 #                  data: {"type":"tool","id":...,"content":...}  工具调用开始（显示为状态条）
 #                  data: {"type":"tool_done","id":...}            工具执行完成（状态条变完成态）
 #                  data: {"type":"text","content":...}  模型回答 token 分片（前端逐字渐现）
+#                  data: {"type":"sources","items":[...]} 参考来源（第1步·引用溯源，回答后下发）
 #                  data: {"type":"error","content":...} 出错提示
 #                  data: {"type":"done"}                结束标记
 import json
@@ -90,6 +91,9 @@ def stream_events(query: str, session_id: str = "", user_id: str = ""):
     mem_key = f"{user_id}:{session_id}" if session_id else ""
     #历史消息 + 本次问题拼成完整输入；session_id 为空（旧前端）则退化为无记忆单轮问答
     history = memory.get_history(mem_key) if mem_key else []
+    #【第1步·1.4】溯源收集容器：挂在运行时上下文里，rag_summarize 工具检索后把来源追加进来，
+    #流正常结束时统一下发（sources 事件）；工具在容器缺失时静默跳过
+    sources_sink: list = []
     input_dict = {"messages": [*history, {"role": "user", "content": query}]}
     seen_tool_indices: set = set()   #记录已上报过的工具调用序号，避免一个调用报多次
     seen_tool_done_ids: set = set()  #记录已下发 tool_done 的 tool_call_id，避免工具返回分片时重复下发
@@ -111,7 +115,7 @@ def stream_events(query: str, session_id: str = "", user_id: str = ""):
         #【新增】current_user 注入登录用户ID，工具据此默认查询登录者本人的数据
         for chunk, meta in agent.agent.stream(
             input_dict, stream_mode="messages",
-            context={"report": False, "current_user": user_id}):
+            context={"report": False, "current_user": user_id, "sources": sources_sink}):
             #工具执行完成（ToolMessage 返回）：下发 tool_done，前端把对应状态条标记为完成；
             #按 tool_call_id 去重（部分框架版本工具返回可能拆成多个分片）
             if isinstance(chunk, ToolMessage):
@@ -167,6 +171,11 @@ def stream_events(query: str, session_id: str = "", user_id: str = ""):
 
         #流结束：结算最后一条消息
         settle_message()
+
+        #【第1步·1.4】引用溯源：把本次对话中检索到的来源统一下发，
+        #前端在回答气泡下方渲染"参考来源"折叠列表（按 id 去重已在工具侧完成）
+        if sources_sink:
+            yield {"type": "sources", "items": sources_sink}
     except Exception as e:
         #异常只进日志，返回给前端的是友好提示
         logger.error(f"[web]对话流异常：{str(e)}", exc_info=True)
@@ -458,6 +467,17 @@ PAGE_HTML = """<!DOCTYPE html>
   /* 工具执行完成：圆点变绿并停止呼吸动画 */
   .tool-line.done .t-dot { background: var(--mint); animation: none; }
   .err { color: #ef4444; font-size: 13px; margin: 2px 0 12px 4px; }
+
+  /* 【第1步·1.4】参考来源折叠列表：挂在回答消息下方，默认收起 */
+  .sources-box { margin: -4px 0 14px 4px; max-width: 80%; }
+  .sources-box details {
+    background: rgba(16,185,129,.06); border: 1px dashed rgba(16,185,129,.45);
+    border-radius: 10px; padding: 7px 12px; font-size: 12.5px; color: var(--ink);
+  }
+  .sources-box summary { cursor: pointer; color: var(--mint-deep); font-weight: 600; outline: none; }
+  .source-item { margin-top: 6px; padding-top: 6px; border-top: 1px dashed var(--line); }
+  .source-head { font-weight: 600; }
+  .source-snippet { color: var(--sub); margin-top: 2px; line-height: 1.6; }
 
   #input-bar {
     display: flex; gap: 10px; align-items: center;
@@ -858,6 +878,37 @@ function handleAuthExpired(message) {
   loginId.focus();
 }
 
+//【第1步·1.4】渲染"参考来源"折叠列表：挂在对应回答消息下方，可展开查看来源与片段
+function renderSources(bubble, items) {
+  if (!items || !items.length) return;
+  const msgEl = bubble.closest('.msg');
+  if (!msgEl) return;
+  const box = document.createElement('div');
+  box.className = 'sources-box';
+  const details = document.createElement('details');
+  const summary = document.createElement('summary');
+  summary.textContent = '参考来源（' + items.length + ' 条）';
+  details.appendChild(summary);
+  items.forEach((it) => {
+    const row = document.createElement('div');
+    row.className = 'source-item';
+    const head = document.createElement('div');
+    head.className = 'source-head';
+    //来源内容全部走 textContent，不参与 HTML 拼接
+    head.textContent = (it.source || '') + (it.entry ? ' · ' + it.entry : '') +
+                       (it.title ? ' · ' + it.title : '');
+    const snip = document.createElement('div');
+    snip.className = 'source-snippet';
+    snip.textContent = it.snippet || '';
+    row.appendChild(head);
+    row.appendChild(snip);
+    details.appendChild(row);
+  });
+  box.appendChild(details);
+  msgEl.insertAdjacentElement('afterend', box);
+  scrollToBottom();
+}
+
 async function send(query) {
   if (!query.trim()) return;
   addUserMsg(query);
@@ -911,6 +962,8 @@ async function send(query) {
           if (!bubble.querySelector('.thinking')) {
             bubble.innerHTML = '<div class="thinking"><span class="spinner"></span><span>正在思考…</span></div>';
           }
+        } else if (ev.type === 'sources') {
+          renderSources(bubble, ev.items);     //【第1步·1.4】渲染参考来源折叠列表
         } else if (ev.type === 'error') {
           addError(ev.content);
           finishAllToolLines();                //出错中断：剩余工具条不再等待
@@ -962,3 +1015,29 @@ if __name__ == "__main__":
     #【新增】端口可用环境变量 APP_PORT 覆盖（默认 8618），便于与原目录的旧服务同时运行
     port = int(os.getenv("APP_PORT", "8618"))
     uvicorn.run(app, host="127.0.0.1", port=port)
+
+
+# ============================================================================================
+# 【第 1 步 · 1.4 说明】引用溯源的 Web 侧改造（本文件的改动说明）
+# --------------------------------------------------------------------------------------------
+# 改动点（共 4 处 + 前端样式/函数）：
+#   1. stream_events 创建 sources_sink 列表并放进 runtime context（与 current_user 同款机制）；
+#   2. rag_summarize 工具把检索来源追加进该列表（见 agent/tools/agent_tools.py 底部说明）；
+#   3. 对话流正常结束后 yield {"type":"sources","items":[...]} —— 新增第 6 种 SSE 事件；
+#   4. 前端新增 'sources' 分支 + renderSources()：在回答消息下方渲染"参考来源"折叠列表，
+#      逐条展示 来源文件·条目号·标题·片段（全部 textContent 渲染，无 HTML 拼接）。
+# 为什么在"流结束"而不是"工具完成"时下发：
+#   一轮对话可能检索多次（报告模式会多轮调工具），结束时统一下发可按 id 去重、一次展示全量来源；
+#   且来源天然属于"答案之后"的信息，跟在前端打字机效果之后展示体验更自然。
+# 边界处理：
+#   - 无检索（闲聊类问题）→ sources_sink 为空 → 不发 sources 事件，前端无变化；
+#   - 异常中断 → 不走正常分支，不发来源（与"出错不写会话记忆"同款保守策略）；
+#   - 来源内容来自自家知识库，仍统一用 textContent 渲染，杜绝注入类问题面。
+# 与评测的关系：
+#   sources 事件是 run_answer.py 做 groundedness 判分的间接依据（答案结论应能在来源中找到）——
+#   这也是"可追溯"从展示需求升级为质量需求的地方。
+# 验证方式：
+#   启动服务后问一个知识库问题：气泡下方出现"参考来源（N 条）"，展开可见条目明细；
+#   浏览器 DevTools 里可看到 data: {"type":"sources", ...} 事件。
+# ============================================================================================
+

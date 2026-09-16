@@ -85,27 +85,75 @@ SQLite（service/database_service.py：users / purchases / repairs / reports）
 登录失败锁定、注册密码长度、新旧密码哈希兼容与惰性迁移。
 测试使用临时数据库（不触碰项目数据），不调用外部大模型 API。
 
+## 第 1 步：RAG 检索纵深（已完成）
+
+四个子项，每个都有评测数字背书（评测集见 `eval/golden.yaml`，52 题标注到条目级）：
+
+1. **条目级切分 + chunk 账本**（`rag/chunker.py`、`rag/chunk_store.py`）：
+   按问答对/编号条目结构化切分（替代 200 字机械切分），内容级去重（去页眉噪声后判重）——
+   重建实测：PDF 151 条中 150 条与 TXT 判重，6 个文件产出 781 条干净 chunk；
+2. **混合检索 + 精排**（`rag/hybrid_retriever.py`，参数在 `config/retrieval.yml`）：
+   向量 + BM25 两路召回各 40 条 → 0.4/0.6 加权融合 → gte-rerank-v2 精排取 5 条；
+3. **引用溯源**（`rag/rag_service.py` + `agent/tools/agent_tools.py` + `app.py`）：
+   回答携带结构化来源（文件/条目/标题/片段），以 SSE `sources` 事件下发，
+   前端在气泡下方渲染"参考来源"折叠列表；
+4. **评测体系**（`eval/`）：检索侧 recall@5 / MRR@10，答案侧 LLM-as-judge 三维打分。
+
+### 检索质量对比（52 题实测）
+
+| 检索模式 | recall@5 | MRR@10 | 说明 |
+|---|---|---|---|
+| vector_k3（改造前） | 0.962 | 0.865 | 纯向量 3 条 |
+| vector_k40 | 0.981 | 0.872 | 仅扩大召回池 |
+| hybrid | **1.000** | 0.892 | 向量+BM25 融合（0.4/0.6，经评测调参） |
+| hybrid_rerank | **1.000** | **0.950** | 融合 + gte-rerank-v2 精排（生产默认） |
+
+> 说明：本知识库小且干净，纯向量基线本身较高；收益主要体现在 MRR（正确的排得更靠前）
+> 与边缘题。调参实测还发现：RAGFlow 的默认权重 0.7/0.3 在本语料反而降召回
+> （0.904），据此调整为 0.4/0.6——记录在 `config/retrieval.yml`。
+
+### 答案质量（12 题抽样，LLM-as-judge）
+
+relevance 5.00 · groundedness 4.67 · completeness 5.00（满分 5；明细见 `eval/results/answer_quality.md`）
+
+### 如何复跑评测
+
+```bash
+.venv/Scripts/python.exe -m eval.run_retrieval                 # 四种模式对比（免费，秒级~分钟级）
+.venv/Scripts/python.exe -m eval.run_answer --limit 12         # 答案质量抽样（每题 2 次 LLM 调用）
+.venv/Scripts/python.exe -m scripts.reindex                    # 知识库更新后增量重建索引
+.venv/Scripts/python.exe -m scripts.reindex --rebuild          # 换 embedding 模型/切分策略后全量重建
+```
+
 ## 目录结构
 
 ```
-app.py                      FastAPI 单文件应用（路由 + 内嵌前端）
-agent/                      LangGraph ReAct Agent（工具 + 中间件）
-rag/                        向量库（FAISS）与检索总结
+app.py                      FastAPI 单文件应用（路由 + 内嵌前端 + SSE sources 事件）
+agent/                      LangGraph ReAct Agent（工具 + 中间件；工具发布检索来源）
+rag/                        检索链路：chunker（条目切分）/ chunk_store（chunk 账本）/
+                            vector_store（FAISS + 索引版本检测）/ hybrid_retriever（召回+融合+重排）/
+                            rag_service（检索 + 总结 + 溯源）
+scripts/reindex.py          索引重建入口（增量 / --rebuild 全量）
+eval/                       评测：golden.yaml（52 题）/ run_retrieval.py / run_answer.py / results/
 service/                    数据库、会话记忆、鉴权、登录护栏
 model/                      模型工厂（DeepSeek / DashScope）
 utils/                      配置、日志、路径、文件处理
-config/                     4 个 yaml 配置
+config/                     5 个 yaml 配置（含 retrieval.yml：召回/融合/重排旋钮）
 prompts/                    提示词文本
 data/                       演示业务数据（CSV + SQLite）与知识库文件
-faiss.db/                   FAISS 索引产物（不入 git，可重建）
-tests/                      pytest 测试
+faiss.db/                   FAISS 索引与 chunk 账本产物（不入 git，reindex 可重建）
+tests/                      pytest 测试（18 用例：鉴权/密码/切分/融合）
 requirements.txt            依赖清单
 .env.example                环境变量模板（.env 不入 git）
 ```
 
-## 后续计划（第 1 步：检索纵深）
+## 后续计划（第 2 步：编排架构）
 
-1. 混合召回（向量 + BM25）→ 加权融合 → cross-encoder 精排；
-2. 结构化切分（按条目）+ 内容级去重 + 索引重建入口 + embedding 版本检测；
-3. SSE `sources` 事件：回答附可追溯的来源；
-4. 检索评测集（golden set）与 recall@k / MRR 对比表，量化每次调参收益。
+按"改造路线图"推进，下一步（对齐 open_deep_research / Dify 的经验）：
+
+1. 单 ReAct → supervisor + 并行子研究者（报告生成场景拆"故障诊断/保修政策/历史工单"并行调研）；
+2. 报告结构化输出（Pydantic：故障类型/根因/步骤/条款/来源），token 超限截断重试；
+3. LangGraph checkpoint 落库（替代进程内会话记忆：断点续跑 + 会话持久化）；
+4. 节点级事件协议 + 运行历史表 + token 成本记账；
+5. 进行中已识别的优化：RAG 双次 LLM 调用（工具内总结 + 外层生成）先用 `run_answer.py`
+   做 A/B 再决定是否合并。

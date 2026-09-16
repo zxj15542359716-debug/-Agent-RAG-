@@ -1,0 +1,5 @@
+external_data_path: data/external/records.csv
+#【新增】SQLite 数据库文件路径（用户/购买/维修三张表，首次启动从 CSV 自动导入）
+database_path: data/database/aftersales.db
+#【修改】外设保修期（月）：自购买时间起算，12 表示一年保修，可配置
+warranty_months: 12

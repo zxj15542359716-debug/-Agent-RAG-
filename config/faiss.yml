@@ -1,0 +1,12 @@
+# 【修改】原 config/chroma.yml 已重命名为本文件：向量库由 Chroma 更换为 FAISS
+# （原因：Chroma 第二次运行时 hnsw 索引加载失败）
+# FAISS 没有"集合/表"的概念，故删除了原 collection_name 字段
+persist_directory: faiss.db
+k: 3
+data_path: data
+md5_hex_store: md5.text
+allowed_knowledge_file_type: ["txt","pdf"]
+
+chunk_size: 200
+chunk_overlap: 20
+separators: ["\n\n","\n",".","!","?","。","！","？"," ",""]

@@ -51,11 +51,20 @@ def load_agent_config(configer_path:str = get_abs_path("config/agent.yml"),encod
         #全量加载
         return yaml.load(f, Loader=yaml.FullLoader)
 
+#检索配置（第1步·检索纵深：混合召回/融合权重/重排档位参数）
+def load_retrieval_config(configer_path:str = get_abs_path("config/retrieval.yml"),encoding:str="utf-8"):
+    #打开config文件
+    with open(configer_path, "r", encoding=encoding) as f:
+        #全量加载
+        return yaml.load(f, Loader=yaml.FullLoader)
+
 rag_config = load_rag_config()
 # 【修改】向量库由 Chroma 更换为 FAISS：模块级配置对象改名 faiss_config
 faiss_config = load_faiss_config()
 prompts_config = load_prompts_config()
 agent_config = load_agent_config()
+# 【第1步·检索纵深】检索参数（mode/召回条数/融合权重/重排），见 config/retrieval.yml
+retrieval_config = load_retrieval_config()
 
 if __name__ == '__main__':
     print(rag_config["chat_model_name"])

@@ -1,0 +1,35 @@
+#检索配置（第1步·检索纵深）
+#mode: vector=纯向量（改造前行为，用于对照）；hybrid=向量+BM25 混合（生产推荐）
+mode: hybrid
+vector_top_k: 40        #向量路召回条数（原实现 k=3，是召回天花板）
+bm25_top_k: 40          #关键词路召回条数（jieba 分词 + BM25Okapi）
+fuse_weights:           #融合权重（对齐 RAGFlow 默认：全文 0.7 / 向量 0.3，可调）
+  keyword: 0.7
+  vector: 0.3
+fuse_top_k: 40          #融合后进入重排的候选池大小
+rerank_provider: dashscope   #dashscope | local | none（none 用于消融对照组）
+rerank_model: gte-rerank-v2
+rerank_top_n: 5         #重排后进入提示词的条数
+
+# ============================================================================================
+# 【第 1 步 · 1.2/1.3 说明】检索参数（本文件每个旋钮的含义与取舍）
+# --------------------------------------------------------------------------------------------
+# 为什么混合检索：
+#   纯向量对"型号/数字/专有名词"等精确词不敏感——用户问"G304 保修多久"这类含型号的查询，
+#   embedding 容易把"语义相近但型号不同"的条目排前面；BM25 对精确词是天然强项。
+#   两路召回互补，按权重融合，是工业级 RAG（如 RAGFlow 默认 0.7 全文 / 0.3 向量）的标准做法。
+# 为什么重排：
+#   向量相似度只是"粗排"分数，"语义最像"不等于"最能回答问题"；
+#   cross-encoder（重排模型）同时看 query 与候选原文做精排，显著改善 top-5 的排序质量。
+#   rerank_provider=none 可跑出对照组，量化重排带来的收益（写进评测对比表）。
+# 三个旋钮（全部可调、全部可量化）：
+#   ① 召回条数 vector_top_k / bm25_top_k（把候选池从 3 拉到 40）
+#   ② 融合权重 fuse_weights（关键词 vs 向量的话语权）
+#   ③ 重排档位 rerank_provider / rerank_top_n（精排与否、精排取前几）
+# 怎么量化：eval/run_retrieval.py --modes vector_k3,vector_k40,hybrid,hybrid_rerank
+#           输出 recall@5 / MRR@10 对比表，改配置后重跑即可看到数字变化。
+# 依赖说明：
+#   dashscope 重排用阿里云百炼 gte-rerank-v2（复用已有 DASHSCOPE_API_KEY，零新增部署）；
+#   local 为可选本地重排（BAAI/bge-reranker-base），需自行 pip install sentence-transformers，
+#   不装则报错提示，不影响 dashscope/none 两种模式使用。
+# ============================================================================================

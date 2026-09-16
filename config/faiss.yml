@@ -1,12 +1,31 @@
 # 【修改】原 config/chroma.yml 已重命名为本文件：向量库由 Chroma 更换为 FAISS
 # （原因：Chroma 第二次运行时 hnsw 索引加载失败）
 # FAISS 没有"集合/表"的概念，故删除了原 collection_name 字段
+# 【第1步·检索纵深】切分策略改为"按条目切分"（详见 rag/chunker.py）；
+# 下列 chunk_size/overlap/separators 仅作为超长条目的兜底二次切分参数
 persist_directory: faiss.db
-k: 3
+k: 3                      # 兼容旧代码的向量条数；生产检索参数见 config/retrieval.yml
 data_path: data
 md5_hex_store: md5.text
 allowed_knowledge_file_type: ["txt","pdf"]
+chunk_store_path: faiss.db/chunks.db   # 【新增】chunk 账本（BM25 召回/引用溯源/评测的数据源）
+max_entry_chars: 500      # 【新增】条目超过该长度才触发兜底二次切分
 
-chunk_size: 200
+chunk_size: 200           # 兜底二次切分的片长（条目级切分不受此影响）
 chunk_overlap: 20
 separators: ["\n\n","\n",".","!","?","。","！","？"," ",""]
+
+# ============================================================================================
+# 【第 1 步 · 1.1 说明】向量库配置（本文件各项的作用）
+# --------------------------------------------------------------------------------------------
+# persist_directory : FAISS 索引目录（index.pkl 向量文件 + index_meta.json 版本信息都在这）
+# k                 : 旧版纯向量检索条数（3 条）——保留仅为兼容历史代码；
+#                     现在生效的检索参数在 config/retrieval.yml（召回 40 → 融合 → 重排取 5）
+# data_path         : 知识库文件目录（data/ 下的 txt 与 pdf）
+# md5_hex_store     : 文件级去重记录（一行一个文件 md5，跳过未变化文件）
+# allowed_knowledge_file_type : 允许入库的文件后缀；txt 会先于 pdf 处理，
+#                     同内容重复时保留 TXT 版本（PDF 抽取的文本常有格式噪声）
+# chunk_store_path  : 【新增】chunk 账本 SQLite 路径，与索引同目录、同生命周期
+# max_entry_chars   : 【新增】条目级切分的长度上限，超过才用下面的兜底参数二次切分
+# chunk_size/overlap/separators : 兜底二次切分参数（仅作用于超长条目，通常是 PDF 文本）
+# ============================================================================================

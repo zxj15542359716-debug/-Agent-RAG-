@@ -204,7 +204,8 @@ requirements.txt            依赖清单
 ## 后续计划
 
 1. 第 2 步第 ⑤ 项：RAG 双次 LLM 调用（工具内总结 + 外层生成）先用 `run_answer.py` 做 A/B 再决定是否合并；
-2. **待确认**：`config/retrieval.yml` 的 `mode` 目前是 `hybrid`（融合、不重排），
-   而上文评测表与 README 描述的是 `hybrid_rerank`（MRR 0.950 vs 0.892）——切到重排会略增延迟
-   与重排额度消耗，需权衡后再改（一行配置）；
+2. ~~**待确认**：`config/retrieval.yml` 的 `mode` 目前是 `hybrid`（融合、不重排）~~ ——
+   **已于 2026-09-17 切换为 `hybrid_rerank`**：上文评测表、本文档与简历口径统一到重排档
+   （MRR@10 0.950 vs 0.892）。代价是每次查询多一次 DashScope 重排调用（额度 + 少量延迟），
+   如后续要测延迟/额度，用 `eval/run_retrieval.py --modes hybrid,hybrid_rerank` 对比即可；
 3. 第 2 步版单文件 HTML 讲解页与课程交付材料。

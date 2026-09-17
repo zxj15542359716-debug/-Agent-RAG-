@@ -1,6 +1,9 @@
 #检索配置（第1步·检索纵深）
-#mode: vector=纯向量（改造前行为，用于对照）；hybrid=向量+BM25 混合（生产推荐）
-mode: hybrid
+#mode: vector=纯向量（改造前行为，用于对照）；hybrid=向量+BM25 融合（不重排）；
+#      hybrid_rerank=融合+gte-rerank-v2 精排（生产默认）
+#2026-09-17 由 hybrid 切换为 hybrid_rerank：README 与评测表均以重排档为准（MRR@10 0.950 vs 0.892），
+#简历/面试口径也引重排档数字——让配置、文档、对外说法三处一致。代价是每次查询多一次重排调用。
+mode: hybrid_rerank
 vector_top_k: 40        #向量路召回条数（原实现 k=3，是召回天花板）
 bm25_top_k: 40          #关键词路召回条数（jieba 分词 + BM25Okapi）
 fuse_weights:           #融合权重（本语料实测最优 0.4/0.6；RAGFlow 默认 0.7/0.3 在本库反而降召回）

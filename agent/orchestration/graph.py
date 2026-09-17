@@ -1,11 +1,10 @@
 #编排图装配（第2步·编排架构）
 #【新增】把"单 ReAct"收成一条带分支的编排图：
-#   START -> trim_history -> normal -> END        （2.1：日常问答分支 + 会话持久化）
-#   2.2 起在 trim_history 之后插入 classify，并按 route 分出报告分支（三路并行子研究者）。
+#   START -> trim_history -> classify -> normal -> END   （2.2：路由已就位，报告分支 2.3 接入）
 from langgraph.graph import END, START, StateGraph
 
 from agent.orchestration.checkpoint import get_checkpointer
-from agent.orchestration.nodes import make_normal_node, trim_history
+from agent.orchestration.nodes import classify, make_normal_node, trim_history
 from agent.orchestration.state import OrchestratorState
 from agent.react_agent import ReactAgent
 from utils.logger_handler import logger
@@ -15,9 +14,13 @@ def build_orchestrator_graph(react_agent: ReactAgent, checkpointer=None):
     """装配编排图。checkpointer 传 None 时用全局 SqliteSaver（测试可传 InMemorySaver/临时库）。"""
     graph = StateGraph(OrchestratorState)
     graph.add_node("trim_history", trim_history)
+    graph.add_node("classify", classify)
     graph.add_node("normal", make_normal_node(react_agent))
     graph.add_edge(START, "trim_history")
-    graph.add_edge("trim_history", "normal")
+    graph.add_edge("trim_history", "classify")
+    #【2.2 临时直连】路由结果已写入 state.route（可观测、可测试），但报告分支尚未接入，
+    #两条路由目前都先走日常问答；2.3 会用条件边把 route=="report" 接到并行子研究者
+    graph.add_edge("classify", "normal")
     graph.add_edge("normal", END)
     return graph.compile(checkpointer=checkpointer if checkpointer is not None else get_checkpointer())
 
@@ -65,4 +68,9 @@ if __name__ == "__main__":
 # 任何重写都会让既有行为重新变成"未验证状态"；这里只把它的编译产物当函数调用。
 # 与其它文件的关系：checkpoint.py 提供 saver，nodes.py 提供节点，state.py 提供通道；
 # app.py 用 OrchestratorAgent().graph 替代原来的 ReactAgent().agent 作为流式入口。
+#
+# 【第 2 步 · 2.2 追加说明】图在 trim_history 之后插入 classify 节点（纯规则意图路由）。
+# 本子项只把"路由决策"落地并记录（state.route + 时间线事件），报告分支的边在 2.3 接入——
+# 之所以分开提交：路由是可独立测试的纯逻辑（tests/test_router.py 覆盖典型问法），
+# 先把它锁死，2.3 接并行分支时只需改一条边，不必同时怀疑"是路由错了还是分支错了"。
 # ============================================================================================

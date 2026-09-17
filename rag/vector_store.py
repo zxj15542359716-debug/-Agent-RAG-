@@ -1,10 +1,4 @@
-#向量库服务（FAISS）——第1步·检索纵深（改造版）
-#【第1步·1.1 改造】相对原版的四点变化：
-#1. 切分由"固定 200 字/20 重叠"改为"按条目切分"（rag/chunker.py），chunk 带元数据；
-#2. 新增 chunk 账本（rag/chunk_store.py）：内容级去重 + BM25 数据源 + 引用溯源 + 评测对照；
-#3. 新增索引版本检测（faiss.db/index_meta.json）：记录 embedding 模型与切分配置，
-#   加载时校验——换模型后旧索引不再被静默使用（原实现会返回垃圾结果且无任何提示）；
-#4. 新增全量重建入口（rebuild()，配合 scripts/reindex.py 使用）。
+#向量库服务（FAISS）
 import json
 import os
 from datetime import datetime

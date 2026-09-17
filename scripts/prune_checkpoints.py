@@ -1,17 +1,4 @@
-#会话持久化库维护（第2步·2.5）
-#用途：控制 data/database/checkpoints.db 的体积——LangGraph 每个 superstep 都会写一条
-#checkpoint（含完整 channel 值），长会话积少成多，需要定期只保留最近若干条。
-#
-#用法（cd 项目根）：
-#  .venv/Scripts/python.exe -m scripts.prune_checkpoints --dry-run          # 只统计，不删除
-#  .venv/Scripts/python.exe -m scripts.prune_checkpoints --keep 50          # 每个会话保留最近 50 条
-#  .venv/Scripts/python.exe -m scripts.prune_checkpoints --drop-ephemeral   # 另清一次性的无会话线程
-#
-#说明：
-#  - checkpoint 是"会话可续聊"的底座，删得过多会影响回看历史（但不会影响当前对话继续）；
-#    默认保留 50 条 ≈ 十几轮对话的完整快照，对演示与课程场景足够。
-#  - 一次性线程（thread_id 以 ephemeral: 开头）来自"无 session_id 的旧前端"，
-#    用完即弃，可安全清掉。
+#会话持久化库维护
 import argparse
 import os
 import sqlite3
@@ -99,16 +86,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
-
-# ============================================================================================
-# 【第 2 步 · 2.5 说明】会话库维护脚本（scripts/prune_checkpoints.py）
-# --------------------------------------------------------------------------------------------
-# 为什么需要：checkpointer 每个 superstep 写一条完整快照（含 messages 等 channel 值），
-# 长会话/多次演示后库会变大；保留策略按"每个会话最近 N 条"最直观，也不影响当前对话继续。
-# 为什么放行 "--dry-run"：删数据是不可逆操作，默认先让人看清会删多少（本项目的运维惯例）。
-# 为什么单独处理 ephemeral 线程：无 session_id 的旧前端会为每次请求新建一次性线程，
-# 这些线程永远不会被续聊，属于纯垃圾；但默认不删（要显式加 --drop-ephemeral）。
-# 与其它文件的关系：库路径取自 config/orchestration.yml 的 checkpoint.db_path，
-# 与 agent/orchestration/checkpoint.py 使用同一个库；删的是 LangGraph 自己管理的表。
-# ============================================================================================

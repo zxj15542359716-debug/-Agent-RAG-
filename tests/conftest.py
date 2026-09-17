@@ -1,6 +1,4 @@
 #测试公共夹具
-#说明：测试通过 FastAPI TestClient 直接调用应用，不启动真实服务器、不调用外部大模型 API；
-#数据库使用临时文件（tmp_path），不触碰项目内 data/database/aftersales.db。
 import os
 import sys
 from pathlib import Path
@@ -21,12 +19,7 @@ os.environ.setdefault("DASHSCOPE_API_KEY", "sk-test-placeholder")
 
 @pytest.fixture(autouse=True)
 def no_network(monkeypatch):
-    """【第2步·2.3】禁止测试联网：拦截 OpenAI 客户端的 chat.completions.create。
-
-    为什么需要：第 2 步引入编排图后，"报告问法"的用例会真的走到子研究者（内部直接调模型），
-    一旦漏改替身就会悄悄打真实接口——既烧额度，又让"离线可复跑"的测试纪律失效。
-    装了这层哨兵，任何漏网的联网调用都会立刻报错并指出原因。
-    """
+    """【第2步·2.3】禁止测试联网：拦截 OpenAI 客户端的 chat.completions.create"""
     try:
         import openai.resources.chat.completions as _completions
     except Exception:       #openai 不可用时跳过（不影响其它用例）
@@ -44,10 +37,7 @@ def no_network(monkeypatch):
 
 @pytest.fixture()
 def client_and_db(tmp_path, monkeypatch):
-    """临时数据库 + TestClient：每个用例独立数据库，互不干扰。
-
-    import_seed=False 跳过 CSV 初始导入（否则每个用例都要 bcrypt 哈希 170+ 个用户，太慢）。
-    """
+    """临时数据库 + TestClient：每个用例独立数据库，互不干扰"""
     from service import database_service as db_module
 
     db = db_module.DatabaseService(db_path=str(tmp_path / "test.db"), import_seed=False)

@@ -36,19 +36,3 @@ if __name__=="__main__":
 
     for chunk in agent.execute_stream("在我所在的地区怎么选键盘"):
         print(chunk,end="",flush=True)
-
-
-# ============================================================================================
-# 【第 2 步 · 2.1 说明】本文件在第 2 步的改动（子 Agent 让出持久化职责）
-# --------------------------------------------------------------------------------------------
-# 改动点：create_agent 增加一个参数 checkpointer=False，其余（模型/工具/中间件/系统提示词）
-# 一字未动。
-# 为什么：第 2 步起，会话历史统一由父图（agent/orchestration/graph.py + checkpoint.py）
-# 的 SqliteSaver 持久化。内层 Agent 若也开 checkpointer，会同时存在两套历史——
-# 父图只存 user+assistant（口径同改造前），子图存全量（含工具调用中间消息），
-# 空间翻倍且"以谁为准"变得含糊。
-# 为什么保留这个类：它仍是日常问答分支的实际执行体（agent/orchestration/nodes.py 的
-# normal 节点命令式调用它），也仍是唯一被第 1 步评测覆盖过的问答链路。
-# 验证：.venv/Scripts/python.exe -m agent.react_agent（自检，不联网），
-# 或 .venv/Scripts/python.exe -m pytest tests/test_orchestrator_graph.py
-# ============================================================================================

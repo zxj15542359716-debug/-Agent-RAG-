@@ -1,11 +1,3 @@
-#节点级事件协议（第2步·2.4，2.2 起先落地骨架）
-#【新增】父图节点向 SSE 流写"自定义事件"的统一出口（对应 LangGraph 的 stream_mode="custom"）。
-#事件契约（消费侧见 app.py 的 stream_events 与前端时间线）：
-#   node_start {"type","id","node","kind","label","depth","ts"}      节点开始
-#   node_end   {"type","id","node","kind","status","duration_ms","summary"}  节点结束（含失败/降级）
-#   report     {"type","data"}                                       结构化报告（合成完成后一次性下发）
-#   run        {"type",...}                                          本轮汇总（流末尾，含 token 账）
-#id 由 node_start 生成、node_end 复用，前端据此精确配对，不依赖事件到达顺序。
 import time
 from contextlib import contextmanager
 from uuid import uuid4

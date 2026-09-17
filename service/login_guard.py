@@ -1,9 +1,4 @@
 #登录防爆破护栏
-#【新增】修复：/api/login 原先可无限次尝试。4 位用户ID空间仅 9000 个，
-#配合弱口令/演示默认口令，暴力枚举可在短时间内撞开大量账号。
-#策略：按 (用户ID, 客户端IP) 滑动窗口计数——5 分钟内失败满 5 次锁定 15 分钟，
-#登录成功即清零。进程内存实现（与 session_memory_service 同款模块级单例风格），
-#零外部依赖；服务重启即重置（演示级取舍，生产可替换为 Redis 计数以便多进程共享）。
 import threading
 import time
 from collections import defaultdict, deque

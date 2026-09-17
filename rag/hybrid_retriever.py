@@ -1,9 +1,4 @@
 #混合检索器（第1步·检索纵深）
-#【新增】"向量 + BM25 两路召回 → 加权融合 → (可选) cross-encoder 重排"完整流水线，
-#替代原实现"纯向量 top-3"的单一召回。四种模式供服务运行与消融评测共用：
-#  vector_k3 / vector_k40 —— 纯向量（k 可指定；k3 即改造前行为，用于对照）
-#  hybrid                —— 向量 + BM25 融合后取前 N
-#  hybrid_rerank         —— 融合候选再经重排模型精排（生产默认，见 retrieval.yml）
 import jieba
 from dataclasses import dataclass, replace
 
@@ -61,9 +56,7 @@ class HybridRetriever:
     # ---------------- 召回路 1：向量 ----------------
 
     def _vector_recall(self, query: str, k: int) -> list[RetrievedChunk]:
-        """FAISS 向量召回。注意 FAISS 返回的是 L2 距离（越小越相似），
-        这里统一换算成相似度 1/(1+d) —— 单调递减映射，保证"分数越大越相关"，
-        后续融合与展示都不必再关心距离方向（这是最容易踩反的坑）。"""
+        """FAISS 向量召回。注意 FAISS 返回的是 L2 距离（越小越相似）"""
         hits: list[RetrievedChunk] = []
         for doc, dist in self.vector_store.similarity_search_with_score(query, k=k):
             m = doc.metadata

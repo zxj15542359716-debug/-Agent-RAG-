@@ -1,10 +1,4 @@
-#检索评测脚本（第1步·1.2）
-#【新增】对 golden.yaml 的 52 条标注逐题跑检索，输出 recall@5 / MRR@10，
-#支持一次跑多种模式（vector_k3 / vector_k40 / hybrid / hybrid_rerank）做消融对比。
-#用法（cd 项目根）：
-#  .venv/Scripts/python.exe -m eval.run_retrieval                                   # 默认跑全部四种模式
-#  .venv/Scripts/python.exe -m eval.run_retrieval --modes hybrid --limit 10         # 只跑一种、前10题
-#结果：eval/results/retrieval_<mode>.md（逐题命中明细）+ eval/results/comparison.md（汇总对比表）
+#检索评测脚本
 import argparse
 import sys
 from datetime import datetime
@@ -28,13 +22,7 @@ def load_golden(limit: int | None = None) -> list[dict]:
 
 def evaluate(retriever: HybridRetriever, items: list[dict], mode: str,
              top_k: int = 10) -> dict:
-    """单模式评测：逐题检索 → 判断首次命中位次 → 汇总指标。
-
-    指标定义：
-      recall@5——前 5 条内至少命中一个标注条目的题目占比（本库每题一般 1~2 个相关条目，
-              等价于常用口径的 hit@5；标注多条目时任一命中即算）
-      MRR@10 ——前 10 条内首个命中位次 rank 的 1/rank 的平均（未命中计 0）
-    """
+    """单模式评测：逐题检索 → 判断首次命中位次 → 汇总指标。"""
     hit_at_5 = 0
     mrr_sum = 0.0
     rows: list[dict] = []
@@ -137,27 +125,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
-
-# ============================================================================================
-# 【第 1 步 · 1.2 说明】检索评测（本文件的指标口径与使用方式）
-# --------------------------------------------------------------------------------------------
-# 为什么先建评测再改检索：
-#   改造顺序是"先测基线，再动刀"——没有基线的优化只是感觉；先跑出 vector_k3（改造前行为）
-#   的数字，之后每加一层（召回池/混合/重排）都能回答"这一层带来了多少收益"。
-# 指标口径：
-#   recall@5：前 5 条内命中标注条目的题目占比。标注到"条目级"（来源文件+条目号），
-#             比"命中某文件就算对"严格得多，能真实区分切分与召回质量；
-#   MRR@10 ：首个命中位次倒数的均值，反映"正确的排得有多靠前"（重排的主要受益指标）。
-# 四种模式对应四层收益（消融实验）：
-#   vector_k3 → vector_k40 ：只扩大召回池的收益（原 k=3 是致命瓶颈）
-#   vector_k40 → hybrid    ：关键词路补充精确词召回（型号/数字类问题的主要受益者）
-#   hybrid → hybrid_rerank ：重排把"最像的"换成"最该回答的"（top-1 质量提升）
-# 运行成本：检索评测不调用生成模型——只有 embedding（向量化查询）与重排调用，
-#   52 题 × 4 模式约几十秒、费用可忽略；可随时复跑做回归。
-# 与 run_answer.py 的分工：
-#   本文件评"检索得对不对"；run_answer.py 评"最终答案好不好"（LLM-as-judge）。
-#   检索指标先坏，答案质量必然坏——所以排障顺序永远是先看本文件。
-# 结果文件：eval/results/retrieval_<mode>.md（逐题明细，失败题一眼可见）
-#           eval/results/comparison.md（汇总表，会被 README 引用）
-# ============================================================================================

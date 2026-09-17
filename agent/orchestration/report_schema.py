@@ -1,9 +1,3 @@
-#报告结构化模型（第2步·2.3）
-#【新增】把"模板拼出来的报告文本"升级为"先产出结构化对象、再渲染给用户"：
-#   1. 三个子研究者各产出自己的结论对象（FaultFinding / WarrantyFinding / HistoryFinding）；
-#   2. 合成器产出 AfterSalesReport（Pydantic），再渲染成分节纯文本走 text 事件下发。
-#为什么字段用英文名：结构化输出走的是模型的"工具调用/JSON Schema"，英文键在 schema 生成与
-#各家模型上的兼容性更稳；中文标签只出现在 description 与渲染层（前端卡片用同一套标签映射）。
 import json
 import re
 from typing import get_args, get_origin
@@ -12,13 +6,7 @@ from pydantic import BaseModel, Field, field_validator
 
 
 class _TolerantModel(BaseModel):
-    """对模型输出的常见偏差做容错：该给数组的字段给了单个字符串时，自动包成单元素数组。
-
-    为什么需要：实测三路研究者里，模型习惯把 `"terms": "1）免责情形…；2）送修建议…"`
-    写成一段话而不是数组（人写报告的直觉），Pydantic 校验就会失败并让整路降级。
-    这类偏差不影响信息本身，容错比"整路作废"划算；真正的类型错误（该给对象给了数字）
-    仍然会失败并进入降级链。
-    """
+    """对模型输出的常见偏差做容错：该给数组的字段给了单个字符串时，自动包成单元素数组。"""
 
     @field_validator("*", mode="before")
     @classmethod
@@ -123,12 +111,7 @@ def _type_label(annotation) -> str:
 
 
 def schema_hint(schema: type[BaseModel]) -> str:
-    """把 Pydantic 模型转成给模型看的"字段清单"，用作提示词里的 JSON 契约。
-
-    由模型定义自动生成而不是手写在提示词里：字段一旦增删，提示词与 schema 不会脱节。
-    类型说明必须带上：实测模型会把"字符串数组"写成一段字符串（"1）…；2）…"），
-    也会把对象字段的键名写成自己的叫法（basic_information 而不是 basic_info）。
-    """
+    """把 Pydantic 模型转成给模型看的"字段清单"，用作提示词里的 JSON 契约。"""
     return "\n".join(
         f"- {name}（{_type_label(field.annotation)}）：{field.description or '（无说明）'}"
         for name, field in schema.model_fields.items()
@@ -147,12 +130,7 @@ def output_contract(schema: type[BaseModel]) -> str:
 
 
 def parse_json_object(text: str) -> dict:
-    """从模型输出里抠出第一个 JSON 对象（容错代码块围栏与前后缀说明）。
-
-    为什么需要这道"脏解析"：DeepSeek 的思考模式既不接受强制 tool_choice，也不支持
-    json_schema 形式的 response_format（实测报错见本文件底部说明），子研究者的结构化输出
-    只能走"提示词约定 JSON + 解析"；模型偶尔会带 ```json 围栏或前后解释，这里统一容错。
-    """
+    """从模型输出里抠出第一个 JSON 对象（容错代码块围栏与前后缀说明）。"""
     if not text:
         raise ValueError("模型输出为空")
     s = text.strip()
@@ -184,12 +162,7 @@ def parse_json_object(text: str) -> dict:
 
 
 def render_report_text(report: AfterSalesReport) -> str:
-    """把结构化报告渲染成分节纯文本。
-
-    为什么要这一步：结构化对象是给"系统/卡片"用的，纯文本是给"聊天窗口"用的——
-    两条通道同时下发，浏览器里既能看到报告正文（与改造前的观感一致），
-    又能渲染成结构化卡片；也保证"纯文本"这条路径在卡片渲染失败时依然可读。
-    """
+    """把结构化报告渲染成分节纯文本。"""
     def bullets(items: list[str]) -> str:
         return "\n".join(f"{i}. {x}" for i, x in enumerate(items, 1)) if items else "暂无相关信息"
 
@@ -226,17 +199,3 @@ def render_report_text(report: AfterSalesReport) -> str:
         for c in report.citations:
             lines.append(f"[{c.n}] {c.source} · {c.entry} {c.title}".rstrip())
     return "\n".join(line for line in lines if line is not None)
-
-
-# ============================================================================================
-# 【第 2 步 · 2.3 说明】报告结构化模型（agent/orchestration/report_schema.py）
-# --------------------------------------------------------------------------------------------
-# 改动点：新增三个研究者结论模型 + 报告顶层模型 AfterSalesReport + 纯文本渲染函数。
-# 为什么用 Pydantic 而不是让模型按模板自由生成：模板生成的报告"长得像样但不可追溯、
-# 也不可消费"——字段一旦结构化，就能落库（runs.report_json）、能渲染卡片、
-# 能被下游系统读取；同时把"必须来自检索"的约束落到 citations 字段上。
-# 为什么同时保留纯文本渲染：聊天窗口的主体验仍是"读一段话"，卡片是增强；
-# 结构化输出失败时（模型/接口不支持）直接退化为纯文本合成，用户侧只少一张卡片。
-# 与其它文件的关系：researchers.py 用三个结论模型做 response_format；
-# nodes.synthesize 用 AfterSalesReport；app.py 把 report 事件转给前端卡片。
-# ============================================================================================

@@ -1,8 +1,4 @@
 #登录凭证服务（JWT）
-#【新增】修复越权漏洞（IDOR）：原实现中 /api/chat、/api/report 直接信任请求体里的
-# user_id 字段——任何人伪造该字段即可读取/操作他人数据，无需密码。
-#现在：登录成功由服务端签发带签名的 JWT；业务接口通过 get_current_user 依赖
-#从 Authorization: Bearer <token> 解析身份，不再信任请求体。
 import jwt
 from datetime import datetime, timedelta, timezone
 
@@ -27,11 +23,7 @@ def create_token(user_id: str) -> str:
 
 
 def get_current_user(authorization: str = Header(default="")) -> str:
-    """FastAPI 依赖：从 Authorization: Bearer <token> 解析登录用户ID。
-
-    校验失败一律抛 401（前端据此引导重新登录）；用户身份不再来自请求体，
-    越权查询他人数据的路径被彻底关闭。
-    """
+    """FastAPI 依赖：从 Authorization: Bearer <token> 解析登录用户ID。"""
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="未登录")
     token = authorization[7:].strip()

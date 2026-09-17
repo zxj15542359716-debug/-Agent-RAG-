@@ -21,13 +21,7 @@ _rag_service = None
 _rag_init_lock = threading.Lock()
 
 def _get_rag_service():
-    """惰性获取 RagSummarizeService 单例，延迟导入避免模块加载期重初始化。
-
-    【修复并发竞态】双重检查加锁：FastAPI 多线程下两个并发首问会同时走到
-    None 分支，各自初始化一次 RAG 服务——FAISS 索引重复加载不说，vector_store 的
-    索引文件与 md5.text 追加写会并发踩踏；加锁后初始化只发生一次，
-    其余线程在锁上等待而不是重复初始化（这才是"工具互相等待"的正确姿势：有界、只等一次）。
-    """
+    """惰性获取 RagSummarizeService 单例，延迟导入避免模块加载期重初始化。"""
     global _rag_service
     if _rag_service is None:
         with _rag_init_lock:
@@ -39,11 +33,7 @@ def _get_rag_service():
 
 @tool(description="从向量存储中检索参考资料")
 def rag_summarize(query: str) -> str:
-    """RAG 总结工具：检索知识库并总结回答，异常兜底返回友好提示。
-
-    【第1步·1.4】检索结果同时携带结构化来源（来源文件/条目号/标题/片段），
-    通过 _publish_sources 写入运行时上下文，由 app.py 汇总成 SSE sources 事件下发前端。
-    """
+    """RAG 总结工具：检索知识库并总结回答，异常兜底返回友好提示。"""
     try:
         answer, sources = _get_rag_service().rag_summarize(query)
         _publish_sources(sources)
@@ -55,11 +45,7 @@ def rag_summarize(query: str) -> str:
 
 
 def _publish_sources(sources: list[dict]) -> None:
-    """【第1步·1.4】把检索来源写入运行时上下文（app.py 放入的共享列表，见 stream_events）。
-
-    - 不在图运行环境内（如 __main__ 自检）或上下文未提供容器时静默跳过；
-    - 按 id（来源#条目号）去重：同一轮对话多次检索或重复调用不重复展示。
-    """
+    """【第1步·1.4】把检索来源写入运行时上下文（app.py 放入的共享列表，见 stream_events）。"""
     try:
         sink = (get_runtime().context or {}).get("sources")
     except Exception:
@@ -88,11 +74,7 @@ def _current_user_id() -> str:
 
 @tool(description="从外部系统中获取用户使用与售后维修记录，返回字符串，没检测到返回空字符串")
 def fetch_external_data(user_id: str, month: str) -> str:
-    """查询用户在某月的外设使用与售后维修记录。
-
-    参数：user_id 为4位数字字符串；month 为 YYYY-MM 格式（如 2025-04）。
-    校验不通过返回中文提示而非抛异常；无记录返回空字符串（沿用原契约）。
-    """
+    """查询用户在某月的外设使用与售后维修记录。 """
     #【新增】登录状态下强制使用登录用户的ID（数据默认查登录者本人，防止越权）
     current_user = _current_user_id()
     if current_user:
@@ -122,10 +104,7 @@ def fetch_external_data(user_id: str, month: str) -> str:
 
 @tool(description="查询外设保修状态。外设保修期自购买时间起12个月（一年）。user_id为4位数字字符串；purchase_month为购买时间YYYY-MM格式（如2025-04），不填时返回该用户全部购买记录的保修状态")
 def query_warranty(user_id: str, purchase_month: str = "") -> str:
-    """保修查询工具：自购买时间起保修一年（agent.yml 的 warranty_months 可配置）。
-
-    单月查询返回该购买记录的保修状态；purchase_month 为空时返回该用户全部记录的保修状态。
-    """
+    """保修查询工具：自购买时间起保修一年（agent.yml 的 warranty_months 可配置）。 """
     #【新增】登录状态下强制使用登录用户的ID（只能查自己的保修状态，防止越权）
     current_user = _current_user_id()
     if current_user:
@@ -197,25 +176,3 @@ if __name__ == "__main__":
     print("当前月份:", get_current_month.invoke({}))
     print("用户ID引导:", get_user_id.invoke({}))
     print("上下文标记:", fill_context_for_report.invoke({}))
-
-
-# ============================================================================================
-# 【第 1 步 · 1.4 说明】rag_summarize 工具的溯源改造（本文件的改动说明）
-# --------------------------------------------------------------------------------------------
-# 改动点：rag_summarize 由"返回纯字符串"变为"返回字符串 + 发布来源"。
-#   - rag_service.rag_summarize 现在返回 (答案, 来源列表)；
-#   - 工具把来源经 _publish_sources 追加到运行时上下文的 sources 列表（app.py 创建并传入）；
-#   - app.py 在对话流结束时把收集到的来源以 `sources` SSE 事件下发前端，
-#     前端渲染成"参考来源"折叠列表（可展开看来源文件/条目号/标题/片段）。
-# 为什么走"运行时上下文"而不是改工具返回值：
-#   - 工具返回值会进入模型上下文（喂给 LLM），塞 JSON 来源会挤占 token 且干扰回答；
-#   - 运行时上下文（context）是 LangGraph 提供的进程内共享通道，app.py 与工具天然可见，
-#     现有 current_user 注入、report 标志切换都走这条路——沿用同一机制零新增协议。
-# 边界与兜底：
-#   - 上下文里没有 sources 容器（如单跑 python -m agent.tools.agent_tools 自检）时静默跳过；
-#   - 按 id 去重：同一轮里多次检索命中同一条目只展示一次；
-#   - 来源收集失败绝不影响回答本身（_publish_sources 不抛异常）。
-# 与其它文件的关系：
-#   rag/rag_service.py（产出来源）→ 本工具（发布来源）→ app.py（下发 sources 事件）→ 前端（渲染）。
-# ============================================================================================
-

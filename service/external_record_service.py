@@ -1,8 +1,4 @@
-#外部使用记录数据服务（数据库版）
-#【重构】原 CSV 解析 + 内存缓存升级为 SQLite 查询：建表、迁移与增删改查下沉到
-#service/database_service.py，本类只负责按 (用户ID, 购买时间) 组装对外查询结果。
-#对外接口保持不变（get_records/get_user_months/get_warranty_info/reload/_load_error），
-#上层 agent/tools/agent_tools.py 无需任何改动。注意：返回给模型的数据不含密码字段。
+#外部使用记录数据服务
 from datetime import date
 from typing import Any
 
@@ -12,11 +8,7 @@ from utils.logger_handler import logger
 
 
 class ExternalRecordService:
-    """外部使用记录数据服务（数据库版）
-
-    - 数据源为 SQLite（用户/购买/维修三张表），查询时实时组装，无需内存缓存
-    - _load_error 区分两种失败：数据源故障（数据库不可用）与业务上无记录
-    """
+    """外部使用记录数据服务（数据库版）"""
 
     def __init__(self, db_service=None) -> None:
         #数据库服务可注入（测试用），默认取全局单例
@@ -31,12 +23,7 @@ class ExternalRecordService:
         return True
 
     def get_records(self, user_id: str, month: str) -> dict[str, Any] | None:
-        """查询指定用户在某月的购买记录及其维修记录；无记录返回 None，不抛异常。
-
-        返回结构（与原 CSV 版一致）：
-        {"特征": [...], "外设类型": "...", "售后记录": ["维修日期:损坏原因", ...], "购买时间": "..."}
-        密码只存于 users 表、仅用于登录校验，不在此返回。
-        """
+        """查询指定用户在某月的购买记录及其维修记录；无记录返回 None，不抛异常"""
         if not self._ensure_ready():
             return None
         purchase = self._db.get_purchase(user_id, month)
@@ -65,11 +52,7 @@ class ExternalRecordService:
 
     #保修期计算：保修自购买时间起 warranty_months 个月（agent.yml 配置，默认12）
     def get_warranty_info(self, user_id: str, purchase_month: str) -> dict[str, Any] | None:
-        """查询某用户某购买记录（按购买时间定位）的保修状态。
-
-        返回 {"购买时间","保修截止","状态","剩余月数"或"已过期月数"}；
-        无该购买记录返回 None；月份粒度比较，保修覆盖购买月起 warranty_months 个月。
-        """
+        """查询某用户某购买记录（按购买时间定位）的保修状态"""
         if not self._ensure_ready():
             return None
         purchase = self._db.get_purchase(user_id, purchase_month)

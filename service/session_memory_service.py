@@ -1,15 +1,4 @@
 #临时会话记忆服务
-#【新增】让同一浏览器会话内的多轮对话共享上下文：模型能"记得"本会话前面聊过什么，
-#回答更连贯。记忆只保存在本进程内存中（临时），服务重启即清空；不写数据库、不跨会话共享。
-#仿照 external_record_service.py 的模式：模块级惰性单例 + 容量限制，供 app.py 聊天接口使用。
-#
-#【第2步·2.1 已弃用】聊天链路已不再使用本模块：会话历史改由 LangGraph checkpointer
-#落 SQLite（agent/orchestration/checkpoint.py + graph.py 的 trim_history 节点），
-#隔离键仍是"用户ID:会话ID"，但获得了重启续聊、断点续跑能力（内存版做不到）。
-#为什么文件保留而不删除：① 它是第 0 步"会话按用户隔离"那次安全改造的载体与证据，
-#删掉会让那段说明失去落点；② 本模块的 __main__ 自检仍可独立运行，便于对照理解；
-#③ tests/test_session_memory_deprecated.py 会断言 app.py 不再引用它（防止悄悄回退）。
-#何时可以删：确认不再需要上述三用途时（例如课程交付定稿后）。
 import threading
 from collections import OrderedDict, deque
 
@@ -22,12 +11,7 @@ MAX_CONTENT_CHARS = 2000
 
 
 class SessionMemoryService:
-    """进程内临时会话记忆：session_id -> 消息列表（按时间顺序）
-
-    - get_history 返回该会话最近 N 轮消息，由调用方拼进模型的 messages 输入
-    - append_message 追加一条消息；deque 的 maxlen 自动丢弃最早的旧消息
-    - OrderedDict 维护"最近使用"顺序，会话数超过 MAX_SESSIONS 时淘汰最久未用的
-    """
+    """进程内临时会话记忆：session_id -> 消息列表（按时间顺序"""
 
     def __init__(self, max_turns: int = MAX_TURNS,
                  max_sessions: int = MAX_SESSIONS,
@@ -98,16 +82,3 @@ if __name__ == "__main__":
     print("不存在的会话:", svc.get_history("s2"))
     svc.clear("s1")
     print("清空后:", svc.get_history("s1"))
-
-
-# ============================================================================================
-# 【第 2 步 · 2.1 说明】本文件在第 2 步的状态（已弃用，保留不删）
-# --------------------------------------------------------------------------------------------
-# 状态：聊天链路已不再引用本模块（app.py 的 import 已移除）。会话历史改由
-# agent/orchestration/checkpoint.py 的 SqliteSaver 持久化，由 graph.py 的 trim_history
-# 节点执行"保留最近 10 轮"（max_turns 与这里原 MAX_TURNS=10 对齐，换实现不换行为口径）。
-# 为什么保留：① 第 0 步"会话按用户隔离"安全改造的落点与证据；② __main__ 自检可独立运行，
-# 便于对照内存版与持久化版的差异；③ tests/test_session_memory_deprecated.py 断言
-# app.py 不再引用它——文件在、但被测试盯住，防止有人悄悄改回内存态而无人察觉。
-# 边界：本模块的 LRU 淘汰、内容截断等保护仍然有效，只是不再位于对话链路上。
-# ============================================================================================

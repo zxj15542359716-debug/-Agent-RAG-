@@ -267,3 +267,8 @@ if __name__ == "__main__":
 # 验证方式：python -m rag.hybrid_retriever 对比四模式 top-5；
 #           python -m eval.run_retrieval --modes vector_k3,vector_k40,hybrid,hybrid_rerank
 # ============================================================================================
+
+# 【第 2 步 · 2.4 补充】重排用量记账：_rerank_dashscope 在拿到响应后把 resp.usage 记进
+# 当前运行的账本（utils/usage_ledger.record_rerank）。重排与嵌入是两个模型、两份独立免费
+# 额度，不记这笔账就说不清"额度花在哪了"；拿不到 usage 时只记调用次数，不影响检索本身。
+# ============================================================================================

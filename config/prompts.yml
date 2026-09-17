@@ -11,3 +11,13 @@ researcher_fault_prompt: prompts/researcher_fault.txt
 researcher_warranty_prompt: prompts/researcher_warranty.txt
 researcher_history_prompt: prompts/researcher_history.txt
 report_synthesize_prompt: prompts/report_synthesize.txt
+
+# ============================================================================================
+# 【第 2 步 · 2.3 说明】本文件在第 2 步的改动（提示词路径登记）
+# --------------------------------------------------------------------------------------------
+# 新增 4 个提示词路径键（三个子研究者 + 报告合成），由 utils/Prompt_loader.py 的
+# load_researcher_prompts(kind) / load_report_synthesize_prompt() 读取。
+# 为什么每个研究者一个文件：三者工具面与输出结构都不同（知识库检索 / 真实保修记录 /
+# 使用与维修记录），分开后"角色-工具-输出结构"一一对应，也便于单独调某一个的表现。
+# 与既有三个键的约定完全一致：路径进配置、文件进 prompts/，缺失时 Prompt_loader 抛错。
+# ============================================================================================

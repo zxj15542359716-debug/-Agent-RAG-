@@ -95,3 +95,19 @@ class UsageRecordingEmbeddings(DashScopeEmbeddings):
 
 chat_model = ChatModelFactory().get_model()
 embed_model = DashScopeModelFactory().get_model()
+
+# ============================================================================================
+# 【第 2 步 · 2.4 说明】本文件在第 2 步的改动（模型工厂：流式用量 + 向量化记账）
+# --------------------------------------------------------------------------------------------
+# 改动点（两处）：
+#   1. ChatOpenAI 增加 stream_usage=配置项：本项目的 base_url 是自定义域名，
+#      langchain-openai 只在"默认 base_url"下自动开启 stream_usage——不显式打开，
+#      流式回答拿不到 token 用量，第 2 步的成本记账会退化成"记 0"；
+#   2. 新增 UsageRecordingEmbeddings（DashScopeEmbeddings 子类）：第三方实现取到响应后
+#      丢掉了 resp.usage，导致"向量化花了多少 token"永远是 0；子类按同样的分批（10 条/批）
+#      与退避重试行为重新实现两个嵌入方法，顺手把每批的 usage 记进账本。
+# 为什么不改 site-packages：改第三方源码在重装依赖后会丢失，也不便于课程交付说明改了什么。
+# 边界与兜底：拿不到 usage 时跳过记账，绝不影响向量化本身；QPS 以外的行为与父类保持一致。
+# 与其它文件的关系：记账入口在 utils/usage_ledger.py；消费方是 app.py 的运行收尾。
+# 验证：.venv/Scripts/python.exe -m pytest tests/test_usage_ledger.py
+# ============================================================================================

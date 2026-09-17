@@ -122,18 +122,33 @@ def stream_events(query: str, session_id: str = "", user_id: str = ""):
         cur_msg_has_tool = False
 
     try:
-        #【第2步·2.1】改走编排图：流项形状为 (命名空间, (消息分片, 元数据))，
+        #【第2步·2.3】双流模式：messages=模型分片（打字机/工具状态），custom=节点事件与报告
+        #（node_start/node_end 来自 events.node_span，report/text 来自 synthesize）。
         #subgraphs=True 必须开（日常问答在子 Agent 里执行，不开收不到逐字分片）；
         #config 里的 thread_id 决定本次对话读写哪条会话（checkpointer 据此续接历史）
         #context 与 react_agent.execute_stream 保持一致（middleware 依赖 runtime.context["report"]）；
         #【新增】current_user 注入登录用户ID，工具据此默认查询登录者本人的数据
-        for _ns, (chunk, meta) in agent.graph.stream(
-            input_dict, stream_mode="messages", subgraphs=True,
+        for ns, mode, payload in agent.graph.stream(
+            input_dict, stream_mode=["messages", "custom"], subgraphs=True,
             config={"configurable": {"thread_id": thread_id}},
             context={"report": False, "current_user": user_id, "sources": sources_sink}):
+            #自定义事件直接透传：事件字典的形状本就是前端消费的形状
+            #（node_start/node_end/report/text，见 agent/orchestration/events.py 的事件契约）
+            if mode == "custom":
+                if isinstance(payload, dict) and payload.get("type"):
+                    yield payload
+                continue
+
+            chunk, meta = payload
+            #【第2步·2.3】命名空间顶层段：'normal'=日常问答子图，'researcher'=报告分支的子研究者
+            top = ns[0].split(":")[0] if ns else ""
+
             #工具执行完成（ToolMessage 返回）：下发 tool_done，前端把对应状态条标记为完成；
             #按 tool_call_id 去重（部分框架版本工具返回可能拆成多个分片）
+            #【第2步·2.3】只处理日常问答的：研究者的工具调用不进聊天气泡（进度由时间线呈现）
             if isinstance(chunk, ToolMessage):
+                if top != "normal":
+                    continue
                 tool_call_id = getattr(chunk, "tool_call_id", "")
                 if tool_call_id and tool_call_id not in seen_tool_done_ids:
                     seen_tool_done_ids.add(tool_call_id)
@@ -143,8 +158,11 @@ def stream_events(query: str, session_id: str = "", user_id: str = ""):
                 continue   #其余消息(HumanMessage等)不展示，原始数据在日志中可查
             #【修复重复回答的根因】rag_summarize 等工具内部会再次调用 LLM 生成总结，
             #其 token 会以 langgraph_node=tools 混入外层 messages 流，形成"工具内部回答"，
-            #若不按节点过滤就会与模型节点的最终回答一起展示，造成两遍回答。只展示 model 节点
-            if meta.get("langgraph_node") != "model":
+            #若不按节点过滤就会与模型节点的最终回答一起展示，造成两遍回答。只展示 model 节点。
+            #【第2步·2.3 白名单修正】报告分支的三个子研究者，其 token 同样是 node=="model"
+            #（只是命名空间是 researcher:xxx）——只按节点名过滤会把研究者的中间文本串进聊天气泡
+            #（等于复活"重复回答"老 bug），因此必须同时限定"日常问答子图的 model 节点"。
+            if not (meta.get("langgraph_node") == "model" and top == "normal"):
                 continue
 
             #消息边界：结算上一条消息；工具调用的 index 在每条消息内都从0计，

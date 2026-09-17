@@ -19,6 +19,29 @@ os.environ.setdefault("DEEPSEEK_API_KEY", "sk-test-placeholder")
 os.environ.setdefault("DASHSCOPE_API_KEY", "sk-test-placeholder")
 
 
+@pytest.fixture(autouse=True)
+def no_network(monkeypatch):
+    """【第2步·2.3】禁止测试联网：拦截 OpenAI 客户端的 chat.completions.create。
+
+    为什么需要：第 2 步引入编排图后，"报告问法"的用例会真的走到子研究者（内部直接调模型），
+    一旦漏改替身就会悄悄打真实接口——既烧额度，又让"离线可复跑"的测试纪律失效。
+    装了这层哨兵，任何漏网的联网调用都会立刻报错并指出原因。
+    """
+    try:
+        import openai.resources.chat.completions as _completions
+    except Exception:       #openai 不可用时跳过（不影响其它用例）
+        yield
+        return
+
+    def _blocked(*args, **kwargs):
+        raise RuntimeError(
+            "测试禁止联网：检测到真实的大模型 API 调用。请在用例里替换掉模型调用"
+            "（monkeypatch 掉 run_researcher / synthesize_report / chat_model 等），不要依赖真实接口。")
+
+    monkeypatch.setattr(_completions.Completions, "create", _blocked, raising=False)
+    yield
+
+
 @pytest.fixture()
 def client_and_db(tmp_path, monkeypatch):
     """临时数据库 + TestClient：每个用例独立数据库，互不干扰。

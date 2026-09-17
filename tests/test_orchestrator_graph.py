@@ -54,16 +54,17 @@ def test_orchestrator_graph_contains_route_node():
     assert {"trim_history", "classify", "normal"} <= node_names
 
 
-def test_route_is_recorded_in_state():
-    """2.2 阶段：报告问法会被标记为 route=report（分支 2.3 才接入，当前仍由日常问答作答）"""
-    fake_calls = []
+def test_normal_route_is_recorded_and_answered_by_normal_agent():
+    """日常问法：route=normal，且确实由既有 Agent（替身）作答"""
+    calls = []
 
     class _Inner:
         def invoke(self, payload, context=None):
             from uuid import uuid4
+
             from langchain_core.messages import AIMessage
 
-            fake_calls.append(payload)
+            calls.append(payload)
             return {"messages": [AIMessage(content="收到", id=f"t-{uuid4().hex}")]}
 
     class _Fake:
@@ -72,11 +73,64 @@ def test_route_is_recorded_in_state():
     from agent.orchestration.graph import build_orchestrator_graph
 
     graph = build_orchestrator_graph(_Fake(), checkpointer=InMemorySaver())
-    graph.invoke({"messages": [{"role": "user", "content": "帮我生成一份售后报告"}], "query": "帮我生成一份售后报告"},
+    graph.invoke({"messages": [{"role": "user", "content": "耳机没声音怎么办"}], "query": "耳机没声音怎么办"},
                  config={"configurable": {"thread_id": "u1:s1"}})
     state = graph.get_state({"configurable": {"thread_id": "u1:s1"}})
-    assert state.values["route"] == "report"
-    assert fake_calls, "报告问法在 2.2 阶段仍应由日常问答作答（分支未接入）"
+    assert state.values["route"] == "normal"
+    assert calls, "日常问法应由既有 Agent 作答"
+
+
+def test_report_path_fans_out_three_researchers_in_parallel(monkeypatch):
+    """报告问法 → 三路子研究者"真并行" → 三路结论都进合成器。
+
+    并行性用 threading.Barrier(3) 验证：三路必须同时到达屏障，否则超时抛错——
+    这条断言能挡住"Send 写成了顺序边"这类静默退化（顺序执行时报告耗时会变成三倍）。
+    """
+    import threading
+
+    import agent.orchestration.nodes as nodes_mod
+    from agent.orchestration.report_schema import AfterSalesReport
+
+    barrier = threading.Barrier(3, timeout=5)
+    kinds_seen = []
+
+    def fake_run_researcher(kind, query, context=None):
+        kinds_seen.append(kind)
+        barrier.wait()          #三路必须同时在跑，否则这里抛 BrokenBarrierError
+        return {"fault_type": f"{kind}-结论"}, "ok"
+
+    synth_calls = {}
+
+    def fake_synthesize_report(finding_map, sources, query):
+        synth_calls["findings"] = finding_map
+        synth_calls["query"] = query
+        return AfterSalesReport(fault_type="按键失灵"), "输入 10 tokens（预算 6000）"
+
+    monkeypatch.setattr(nodes_mod, "run_researcher", fake_run_researcher)
+    monkeypatch.setattr(nodes_mod, "synthesize_report", fake_synthesize_report)
+
+    class _Inner:
+        def invoke(self, payload, context=None):
+            raise AssertionError("报告分支不应调用日常问答 Agent")
+
+    class _Fake:
+        agent = _Inner()
+
+    from agent.orchestration.graph import build_orchestrator_graph
+
+    graph = build_orchestrator_graph(_Fake(), checkpointer=InMemorySaver())
+    graph.invoke({"messages": [{"role": "user", "content": "帮我生成一份售后报告"}],
+                  "query": "帮我生成一份售后报告"},
+                 config={"configurable": {"thread_id": "u1:s1"}})
+
+    assert sorted(kinds_seen) == ["fault", "history", "warranty"]
+    assert set(synth_calls["findings"]) == {"fault_finding", "warranty_finding", "history_finding"}
+    assert all(f["status"] == "ok" for f in synth_calls["findings"].values())
+    assert synth_calls["query"] == "帮我生成一份售后报告"
+    state = graph.get_state({"configurable": {"thread_id": "u1:s1"}})
+    assert state.values["report"]["fault_type"] == "按键失灵"
+    #报告正文写回会话历史（下一轮对话能看到上一份报告）
+    assert "售后服务报告" in state.values["messages"][-1].content
 
 
 # 运行：cd 项目根 && .venv/Scripts/python.exe -m pytest tests/test_orchestrator_graph.py

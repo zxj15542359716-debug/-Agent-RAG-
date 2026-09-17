@@ -5,3 +5,9 @@
 main_prompts_path: prompts/main_prompt.txt
 rag_summarize_prompt: prompts/rag_summarize.txt
 report_prompts_path: prompts/report_prompts.txt
+
+#【第2步·2.3】并行子研究者与报告合成提示词（load_researcher_prompts / load_report_synthesize_prompt 读取）
+researcher_fault_prompt: prompts/researcher_fault.txt
+researcher_warranty_prompt: prompts/researcher_warranty.txt
+researcher_history_prompt: prompts/researcher_history.txt
+report_synthesize_prompt: prompts/report_synthesize.txt

@@ -3,9 +3,6 @@
 基于 **LangGraph ReAct Agent + FAISS 向量检索 + FastAPI SSE 流式**的售后智能助手：
 登录/注册、知识库问答（故障排除 · 保养 · 选购）、保修与使用记录查询、售后上报、使用报告生成。
 
-> 本目录是 `E:\C++\.创新_Agent` 的**工作副本**（2026-09-16 全量备份），
-> 原项目保持冻结，全部改造在本目录进行。
-
 ## 架构
 
 ```
@@ -46,7 +43,7 @@ SQLite（service/database_service.py：users / purchases / repairs / reports）
 
 # 3. 启动（默认 http://127.0.0.1:8618）
 .venv/Scripts/python.exe app.py
-# 或双击 启动网页.bat；端口可用环境变量 APP_PORT 覆盖，便于与原目录服务同时运行
+# 或双击 启动网页.bat；端口可用环境变量 APP_PORT 覆盖（默认 8618）
 ```
 
 首次运行且数据库为空时，会自动从 `data/external/records.csv` 导入演示数据。
@@ -203,9 +200,12 @@ requirements.txt            依赖清单
 
 ## 后续计划
 
-1. 第 2 步第 ⑤ 项：RAG 双次 LLM 调用（工具内总结 + 外层生成）先用 `run_answer.py` 做 A/B 再决定是否合并；
-2. ~~**待确认**：`config/retrieval.yml` 的 `mode` 目前是 `hybrid`（融合、不重排）~~ ——
-   **已于 2026-09-17 切换为 `hybrid_rerank`**：上文评测表、本文档与简历口径统一到重排档
-   （MRR@10 0.950 vs 0.892）。代价是每次查询多一次 DashScope 重排调用（额度 + 少量延迟），
-   如后续要测延迟/额度，用 `eval/run_retrieval.py --modes hybrid,hybrid_rerank` 对比即可；
-3. 第 2 步版单文件 HTML 讲解页与课程交付材料。
+1. **让 RAG 少一次模型调用**：当前 `rag_summarize` 工具内部会调用一次模型做总结，外层 Agent 再生成最终回答。
+   计划先迁移提示词，再用 `eval/run_answer.py` 做 A/B（按 relevance / groundedness 判断质量是否下降），
+   有数据支撑后再合并成一次调用；
+2. **量化重排的延迟代价**：检索已切到 `hybrid_rerank`（MRR@10 0.950 vs 融合档 0.892），
+   下一步用 `eval/run_retrieval.py --modes hybrid,hybrid_rerank` 测两者的端到端响应时间差，
+   再决定是否长期保留重排；
+3. **生产化改造**：容器化部署；把 SQLite 换成 PostgreSQL 以支持多实例；
+   把向量检索独立成服务——当前 BM25 索引建在进程内存里，且数据库 / RAG / checkpointer
+   都是进程内单例，多副本部署时每个实例各持一份。

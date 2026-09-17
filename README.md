@@ -63,6 +63,8 @@ SQLite（service/database_service.py：users / purchases / repairs / reports）
 | 向量库参数（chunk、top-k 等） | `config/faiss.yml` | |
 | 数据库路径 / 保修期 | `config/agent.yml` | |
 | 提示词文件路径 | `config/prompts.yml` | |
+| 检索旋钮（召回条数/融合权重/重排） | `config/retrieval.yml` | 第 1 步新增，含调参实测记录 |
+| 编排旋钮（路由词表/checkpoint/报告预算/记账） | `config/orchestration.yml` | 第 2 步新增 |
 
 ## 本次改造内容（安全基线）
 
@@ -81,9 +83,12 @@ SQLite（service/database_service.py：users / purchases / repairs / reports）
 .venv/Scripts/python.exe -m pytest
 ```
 
-覆盖：登录签发 token、无凭证/伪造/过期 token 一律 401、上报身份取自 token、
-登录失败锁定、注册密码长度、新旧密码哈希兼容与惰性迁移。
-测试使用临时数据库（不触碰项目数据），不调用外部大模型 API。
+59 个用例，覆盖：登录签发 token、无凭证/伪造/过期 token 一律 401、上报身份取自 token、
+登录失败锁定、注册密码长度、新旧密码哈希兼容与惰性迁移（第 0 步）；
+条目切分、融合权重与来源字段（第 1 步）；会话持久化与 10 轮裁剪、意图路由、报告结构化与
+截断降级、并行派发、运行历史与越权防护、token 记账（第 2 步）。
+测试使用临时数据库（不触碰项目数据），**不调用外部大模型 API**——
+`tests/conftest.py` 里有联网哨兵：任何漏改的替身都会立刻报错而不是打真实接口。
 
 ## 第 1 步：RAG 检索纵深（已完成）
 
@@ -128,32 +133,78 @@ relevance 5.00 · groundedness 4.67 · completeness 5.00（满分 5；明细见 
 ## 目录结构
 
 ```
-app.py                      FastAPI 单文件应用（路由 + 内嵌前端 + SSE sources 事件）
+app.py                      FastAPI 单文件应用（路由 + 内嵌前端 + SSE 事件；执行时间线与报告卡片）
 agent/                      LangGraph ReAct Agent（工具 + 中间件；工具发布检索来源）
+agent/orchestration/        第2步编排层：graph（图装配）/ router（意图路由）/ researchers（三路并行）/
+                            report_schema（结构化报告）/ events（节点事件）/ checkpoint（会话落库）
 rag/                        检索链路：chunker（条目切分）/ chunk_store（chunk 账本）/
                             vector_store（FAISS + 索引版本检测）/ hybrid_retriever（召回+融合+重排）/
                             rag_service（检索 + 总结 + 溯源）
-scripts/reindex.py          索引重建入口（增量 / --rebuild 全量）
+scripts/                    运维脚本：reindex（索引重建）/ usage_report（用量报表）/
+                            prune_checkpoints（会话库维护）
 eval/                       评测：golden.yaml（52 题）/ run_retrieval.py / run_answer.py / results/
-service/                    数据库、会话记忆、鉴权、登录护栏
-model/                      模型工厂（DeepSeek / DashScope）
-utils/                      配置、日志、路径、文件处理
-config/                     5 个 yaml 配置（含 retrieval.yml：召回/融合/重排旋钮）
-prompts/                    提示词文本
-data/                       演示业务数据（CSV + SQLite）与知识库文件
+service/                    数据库（含运行历史三表）、鉴权、登录护栏（会话记忆已弃用）
+model/                      模型工厂（DeepSeek / DashScope，含向量化用量记账）
+utils/                      配置、日志、路径、usage_ledger（token 记账）
+config/                     6 个 yaml 配置（retrieval.yml 检索旋钮 / orchestration.yml 编排旋钮）
+prompts/                    提示词文本（含第2步的 3 个子研究者与报告合成提示词）
+data/                       演示业务数据（CSV + SQLite + checkpoints.db）与知识库文件
 faiss.db/                   FAISS 索引与 chunk 账本产物（不入 git，reindex 可重建）
-tests/                      pytest 测试（18 用例：鉴权/密码/切分/融合）
+tests/                      pytest 测试（59 用例：鉴权/密码/切分/融合/持久化/路由/报告/记账）
 requirements.txt            依赖清单
 .env.example                环境变量模板（.env 不入 git）
 ```
 
-## 后续计划（第 2 步：编排架构）
+## 第 2 步：编排架构（已完成）
 
-按"改造路线图"推进，下一步（对齐 open_deep_research / Dify 的经验）：
+四个子项（对标 open_deep_research 的 supervisor / RAGFlow 的 checkpoint / Dify 的运行记录）：
 
-1. 单 ReAct → supervisor + 并行子研究者（报告生成场景拆"故障诊断/保修政策/历史工单"并行调研）；
-2. 报告结构化输出（Pydantic：故障类型/根因/步骤/条款/来源），token 超限截断重试；
-3. LangGraph checkpoint 落库（替代进程内会话记忆：断点续跑 + 会话持久化）；
-4. 节点级事件协议 + 运行历史表 + token 成本记账；
-5. 进行中已识别的优化：RAG 双次 LLM 调用（工具内总结 + 外层生成）先用 `run_answer.py`
-   做 A/B 再决定是否合并。
+1. **supervisor 路由 + 复用既有 Agent**（`agent/orchestration/router.py`、`graph.py`）：
+   纯规则判定"报告场景 vs 日常问答"（生成类动词 ∧ 报告类名词同时命中，词表在
+   `config/orchestration.yml`）；日常问答仍走改造前的单 ReAct 快路径，**零额外 LLM 调用**，
+   规则漏判由原有的 `fill_context_for_report` 工具兜底（行为与改造前一致）；
+2. **并行子研究者 + 结构化报告**（`agent/orchestration/researchers.py`、`report_schema.py`）：
+   报告场景用 LangGraph `Send` 扇出三路**真并行**调研（故障诊断 / 保修政策 / 历史工单），
+   合成器产出 Pydantic 结构化报告并同时下发"分节纯文本 + 结构化卡片"；
+   合成输入超预算时按档位截断重试（先截结论长度，再按信息密度丢路：历史→保修）；
+3. **checkpoint 落库**（`agent/orchestration/checkpoint.py`）：
+   LangGraph 官方 SqliteSaver → `data/database/checkpoints.db`，
+   `thread_id = "用户ID:会话ID"`（与原内存记忆同一个隔离键），保留最近 10 轮
+   （`trim_history` 只在用户消息边界裁剪，避免产生孤儿 ToolMessage）；
+   进程重启后同一会话可续聊；原 `service/session_memory_service.py` 已弃用（保留文件 + 测试防回退）；
+4. **节点事件 + 运行历史 + token 记账**（`agent/orchestration/events.py`、`utils/usage_ledger.py`）：
+   节点级 SSE 事件（`node_start` / `node_end` / `report` / `run`）驱动前端"执行时间线"与报告卡片；
+   新增 `runs` / `run_nodes` / `usage_events` 三张表，记录每轮对话的路由、节点耗时、token 成本
+   （回调入账覆盖工具内部 LLM 调用与并行子研究者；嵌入/重排按 DashScope 返回值单独记账）；
+   `GET /api/runs`、`GET /api/usage` 只返回登录用户本人的数据。
+
+### 第 2 步实测（真实调用）
+
+| 场景 | 结果 |
+|---|---|
+| 日常问答 | 单 ReAct 路径不变：一轮实测 6639 tokens / 3 次模型调用 / 35.6s，检索命中 5 条来源 |
+| 报告生成 | 三路并行（15s / 28s / 41s 同时收尾）→ 合成，端到端 73s、10 条来源、结构化报告成功 |
+| 重启续聊 | 换 saver 实例读同一库，历史完整（`tests/test_checkpoint_memory.py`）|
+| 越权防护 | 运行历史/用量接口按登录身份过滤，用他人 run_id 查不到（`tests/test_run_history.py`）|
+
+> 结构化输出的实测结论（已落地，记录在 `agent/orchestration/researchers.py` 说明里）：
+> DeepSeek 思考模式**拒绝强制 tool_choice**（`Thinking mode does not support this tool_choice`），
+> 也**不支持 json_schema 形式的 response_format**；因此改为"提示词给出 JSON 契约（由 Pydantic
+> 模型自动生成）+ 容错解析 + 校验"，失败自动降级为纯文本合成（报告仍可读，卡片标注降级）。
+
+### 运维命令
+
+```bash
+.venv/Scripts/python.exe -m scripts.usage_report --days 7         # 用量与运行报表（花了多少）
+.venv/Scripts/python.exe -m scripts.prune_checkpoints --dry-run   # 会话库维护（先演练再删）
+.venv/Scripts/python.exe -m agent.orchestration.graph             # 编排图自检（打印节点与边）
+.venv/Scripts/python.exe -m agent.orchestration.router            # 意图路由自检（典型问法判定）
+```
+
+## 后续计划
+
+1. 第 2 步第 ⑤ 项：RAG 双次 LLM 调用（工具内总结 + 外层生成）先用 `run_answer.py` 做 A/B 再决定是否合并；
+2. **待确认**：`config/retrieval.yml` 的 `mode` 目前是 `hybrid`（融合、不重排），
+   而上文评测表与 README 描述的是 `hybrid_rerank`（MRR 0.950 vs 0.892）——切到重排会略增延迟
+   与重排额度消耗，需权衡后再改（一行配置）；
+3. 第 2 步版单文件 HTML 讲解页与课程交付材料。

@@ -618,6 +618,36 @@ PAGE_HTML = """<!DOCTYPE html>
   .source-head { font-weight: 600; }
   .source-snippet { color: var(--sub); margin-top: 2px; line-height: 1.6; }
 
+  /* 【第2步·2.5】执行时间线：把节点级事件画成"过程进度"，报告场景能看到三路并行在跑 */
+  .timeline { margin: 0 0 10px 4px; max-width: 82%; font-size: 12px; color: var(--sub); }
+  .tl-item { display: flex; align-items: center; gap: 7px; padding: 2px 0; animation: rise .3s ease both; }
+  .tl-item.sub { margin-left: 14px; }                      /* 子研究者缩进一级，体现从属关系 */
+  .tl-dot { width: 7px; height: 7px; border-radius: 50%; flex: none;
+            background: #93c5fd; animation: pulse 1.4s infinite; }
+  .tl-item.done .tl-dot { background: var(--mint); animation: none; }
+  .tl-item.degraded .tl-dot { background: #f59e0b; animation: none; }   /* 降级：黄 */
+  .tl-item.error .tl-dot { background: #ef4444; animation: none; }      /* 失败：红 */
+  .tl-name { color: var(--ink); font-weight: 600; }
+  .tl-time { color: #9fb0bd; font-variant-numeric: tabular-nums; }
+  .tl-summary { color: var(--sub); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .run-meta { margin-top: 3px; color: #9fb0bd; font-size: 11.5px; }
+
+  /* 【第2步·2.5】结构化报告卡片：与参考来源同款"卡片"语言，字段全部 textContent 渲染 */
+  .report-card {
+    margin: 0 0 14px 4px; max-width: 82%; background: #fff;
+    border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px;
+    box-shadow: 0 4px 14px rgba(36,59,83,.05); font-size: 13.5px;
+  }
+  .report-card h3 { font-size: 14.5px; color: var(--ink); margin-bottom: 6px; }
+  .rc-sec { margin-top: 10px; }
+  .rc-sec-title { font-weight: 700; color: var(--mint-deep); font-size: 12.5px; margin-bottom: 4px; }
+  .rc-row { color: var(--ink); line-height: 1.7; }
+  .rc-kv { color: var(--sub); }
+  .rc-list { padding-left: 20px; color: var(--ink); line-height: 1.7; }
+  .rc-cite { color: var(--sub); font-size: 12px; line-height: 1.6; }
+  .rc-degraded { color: #b45309; background: rgba(245,158,11,.08); border: 1px dashed rgba(245,158,11,.5);
+                 border-radius: 10px; padding: 8px 10px; white-space: pre-wrap; }
+
   #input-bar {
     display: flex; gap: 10px; align-items: center;
     padding: 14px 20px 18px;
@@ -1017,6 +1047,173 @@ function handleAuthExpired(message) {
   loginId.focus();
 }
 
+//【第2步·2.5】每条机器人消息的"尾部锚点"：新块统一插到锚点之后、再把锚点前移。
+//为什么需要：原先 renderSources 用 msgEl.insertAdjacentElement('afterend') 直接插在气泡背后，
+//后插的块会排在前一个前面（后进先出），与时间线/报告卡片混用时顺序会乱。
+//锚点机制保证渲染顺序恒为：气泡 → 执行时间线 → 报告卡片 → 参考来源。
+const bubbleAnchor = new WeakMap();
+
+function attachAfter(bubble, el) {
+  const msgEl = bubble.closest('.msg');
+  if (!msgEl) return el;
+  const anchor = bubbleAnchor.get(bubble) || msgEl;
+  anchor.insertAdjacentElement('afterend', el);
+  bubbleAnchor.set(bubble, el);
+  return el;
+}
+
+//【第2步·2.5】执行时间线：node_start 建条、node_end 变状态、run 事件补成本行
+const timelineMap = new WeakMap();
+
+function fmtMs(ms) {
+  ms = Number(ms) || 0;
+  return ms >= 1000 ? (ms / 1000).toFixed(1) + 's' : ms + 'ms';
+}
+
+function ensureTimeline(bubble) {
+  let tl = timelineMap.get(bubble);
+  if (!tl) {
+    const box = document.createElement('div');
+    box.className = 'timeline';
+    attachAfter(bubble, box);
+    tl = { box, items: new Map() };
+    timelineMap.set(bubble, tl);
+  }
+  return tl;
+}
+
+function nodeStart(bubble, ev) {
+  const tl = ensureTimeline(bubble);
+  const item = document.createElement('div');
+  item.className = 'tl-item' + (ev.depth > 0 ? ' sub' : '');
+  const dot = document.createElement('span');
+  dot.className = 'tl-dot';
+  const name = document.createElement('span');
+  name.className = 'tl-name';
+  name.textContent = ev.label || ev.node || '节点';   //显示中文标签，没有才退化为内部节点名
+  item.appendChild(dot);
+  item.appendChild(name);
+  tl.box.appendChild(item);
+  tl.items.set(ev.id, item);
+  scrollToBottom();
+}
+
+function nodeEnd(bubble, ev) {
+  const tl = timelineMap.get(bubble);
+  if (!tl) return;
+  let item = tl.items.get(ev.id);
+  if (!item) {                       //只收到结束事件（少见）：补建一条，避免信息丢失
+    nodeStart(bubble, ev);
+    item = tl.items.get(ev.id);
+  }
+  item.classList.add(ev.status === 'error' ? 'error' : (ev.status === 'degraded' ? 'degraded' : 'done'));
+  const time = document.createElement('span');
+  time.className = 'tl-time';
+  time.textContent = fmtMs(ev.duration_ms);
+  item.appendChild(time);
+  if (ev.summary) {
+    const s = document.createElement('span');
+    s.className = 'tl-summary';
+    s.textContent = ev.summary;
+    item.appendChild(s);
+  }
+  scrollToBottom();
+}
+
+//本轮汇总：在时间线底部补一行"花了多少、走了哪条路"
+function renderRun(bubble, ev) {
+  const tl = timelineMap.get(bubble);
+  if (!tl) return;
+  const u = ev.usage || {};
+  const parts = [];
+  if (u.total_tokens) parts.push('本轮 ' + u.total_tokens + ' tokens');
+  if (u.embedding_tokens) parts.push('嵌入 ' + u.embedding_tokens);
+  if (u.rerank_tokens) parts.push('重排 ' + u.rerank_tokens);
+  parts.push((Number(ev.duration_ms || 0) / 1000).toFixed(1) + 's');
+  if (ev.route) parts.push(ev.route === 'report' ? '报告模式' : '日常问答');
+  const meta = document.createElement('div');
+  meta.className = 'run-meta';
+  meta.textContent = parts.join(' · ');
+  tl.box.appendChild(meta);
+  scrollToBottom();
+}
+
+//【第2步·2.5】结构化报告卡片：分区展示结构化字段（全部 textContent，无 HTML 拼接）
+function rcSection(card, title, rows, list) {
+  const sec = document.createElement('div');
+  sec.className = 'rc-sec';
+  const t = document.createElement('div');
+  t.className = 'rc-sec-title';
+  t.textContent = title;
+  sec.appendChild(t);
+  (rows || []).forEach((pair) => {
+    if (!pair[1]) return;
+    const row = document.createElement('div');
+    row.className = 'rc-row';
+    const k = document.createElement('span');
+    k.className = 'rc-kv';
+    k.textContent = pair[0] + '：';
+    const v = document.createElement('span');
+    v.textContent = pair[1];
+    row.appendChild(k);
+    row.appendChild(v);
+    sec.appendChild(row);
+  });
+  if (list && list.length) {
+    const ol = document.createElement('ol');
+    ol.className = 'rc-list';
+    list.forEach((x) => {
+      const li = document.createElement('li');
+      li.textContent = x;
+      ol.appendChild(li);
+    });
+    sec.appendChild(ol);
+  }
+  card.appendChild(sec);
+}
+
+function renderReport(bubble, data) {
+  if (!data) return;
+  const card = document.createElement('div');
+  card.className = 'report-card';
+  const h = document.createElement('h3');
+  h.textContent = '📋 售后服务报告';
+  card.appendChild(h);
+  const info = data.basic_info || {};
+  rcSection(card, '一、基本信息', [
+    ['咨询时间', info.consulted_at], ['涉及品类', info.device_types],
+    ['问题类型', info.issue_type], ['保修状态', info.warranty_status],
+  ]);
+  rcSection(card, '二、故障诊断', [['故障类型', data.fault_type]], data.root_causes);
+  rcSection(card, '三、处理步骤', null, data.steps);
+  rcSection(card, '四、适用保修条款', null, data.warranty_terms);
+  rcSection(card, '五、风险提醒与后续建议', [['后续建议', data.follow_up]], data.risk_notes);
+  if (data.citations && data.citations.length) {
+    const sec = document.createElement('div');
+    sec.className = 'rc-sec';
+    const t = document.createElement('div');
+    t.className = 'rc-sec-title';
+    t.textContent = '六、引用来源';
+    sec.appendChild(t);
+    data.citations.forEach((c) => {
+      const row = document.createElement('div');
+      row.className = 'rc-cite';
+      row.textContent = '[' + (c.n || 0) + '] ' + (c.source || '') +
+                        (c.entry ? ' · ' + c.entry : '') + (c.title ? ' · ' + c.title : '');
+      sec.appendChild(row);
+    });
+    card.appendChild(sec);
+  }
+  if (data.degraded_text) {          //结构化失败时的降级文本（如实展示，不假装成功）
+    const warn = document.createElement('div');
+    warn.className = 'rc-degraded';
+    warn.textContent = '结构化合成失败，以下为原始生成文本：' + data.degraded_text;
+    card.appendChild(warn);
+  }
+  attachAfter(bubble, card);
+  scrollToBottom();
+}
+
 //【第1步·1.4】渲染"参考来源"折叠列表：挂在对应回答消息下方，可展开查看来源与片段
 function renderSources(bubble, items) {
   if (!items || !items.length) return;
@@ -1044,7 +1241,8 @@ function renderSources(bubble, items) {
     details.appendChild(row);
   });
   box.appendChild(details);
-  msgEl.insertAdjacentElement('afterend', box);
+  //【第2步·2.5】改走统一锚点：与执行时间线/报告卡片共用插入顺序，避免互相"插队"
+  attachAfter(bubble, box);
   scrollToBottom();
 }
 
@@ -1103,6 +1301,14 @@ async function send(query) {
           }
         } else if (ev.type === 'sources') {
           renderSources(bubble, ev.items);     //【第1步·1.4】渲染参考来源折叠列表
+        } else if (ev.type === 'node_start') {
+          nodeStart(bubble, ev);               //【第2步·2.5】时间线：节点开始
+        } else if (ev.type === 'node_end') {
+          nodeEnd(bubble, ev);                 //【第2步·2.5】时间线：节点结束（状态/耗时/摘要）
+        } else if (ev.type === 'report') {
+          renderReport(bubble, ev.data);       //【第2步·2.5】结构化报告卡片
+        } else if (ev.type === 'run') {
+          renderRun(bubble, ev);               //【第2步·2.5】本轮汇总（token 账/耗时/路由）
         } else if (ev.type === 'error') {
           addError(ev.content);
           finishAllToolLines();                //出错中断：剩余工具条不再等待
@@ -1239,3 +1445,25 @@ if __name__ == "__main__":
 #      GET /api/runs 能看到该轮的节点明细与 token 账。
 # ============================================================================================
 
+
+# ============================================================================================
+# 【第 2 步 · 2.5 说明】前端执行时间线、报告卡片与插入顺序修正（本文件的改动说明）
+# --------------------------------------------------------------------------------------------
+# 改动点（前端部分，全部在 PAGE_HTML 内）：
+#   1. 新增"执行时间线"（.timeline）：node_start 建条、node_end 变状态（绿=完成/黄=降级/红=失败）
+#      并显示耗时与一句话摘要；子研究者按 depth 缩进一级，报告场景能看到三路并行在跑；
+#   2. 新增"结构化报告卡片"（.report-card）：按 AfterSalesReport 的字段分区渲染
+#      （基本信息/故障诊断/处理步骤/保修条款/风险提醒/引用来源），降级模式如实标注；
+#   3. 新增本轮汇总行（.run-meta）：来自 run 事件，显示 token 总量/嵌入/重排/耗时/路由；
+#   4. SSE 分发链新增 4 个分支（node_start / node_end / report / run），其余事件语义不变；
+#   5. 【修复插入顺序】原来 renderSources 直接插在气泡 afterend，后插的块会排到前面
+#      （后进先出）；现改为统一"尾部锚点"（bubbleAnchor），保证顺序恒为
+#      气泡 -> 执行时间线 -> 报告卡片 -> 参考来源。
+# 安全口径：新增的渲染全部走 textContent（与第 1 步的 sources 渲染一致），不做 HTML 拼接。
+# 踩坑记录：JS 字符串里的换行不要用单反斜杠转义——PAGE_HTML 是普通 Python 字符串，
+#   单反斜杠会被 Python 先解释掉，页面里的 JS 就会断行报错（本次由 node --check 抓出）。
+# 验证方式：
+#   node --check（把 <script> 抽出来做语法校验，本项目已用它抓过一次真实语法错误）；
+#   起服务后：日常问答看到"意图识别 -> 智能问答"两条时间线 + 成本行；
+#   问"生成我的使用报告"看到三路并行时间线 + 报告卡片 + 参考来源。
+# ============================================================================================

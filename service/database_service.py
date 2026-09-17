@@ -323,12 +323,21 @@ class DatabaseService:
             run["nodes"] = [dict(n) for n in nodes]
             return run
 
-    def list_runs(self, user_id: str, limit: int = 20) -> list[dict]:
-        """列出某用户最近的运行记录（不含节点明细）"""
+    def list_runs(self, user_id: str | None = None, limit: int = 20) -> list[dict]:
+        """列出最近的运行记录（不含节点明细）。
+
+        user_id 传 None 表示"全部用户"，仅供本地运维脚本使用；
+        接口层（app.py）一律传登录用户ID，SQL 里强制过滤（越权防护不依赖调用方自觉）。
+        """
+        limit = max(1, min(int(limit), 500))
         with self._tx() as conn:
-            rows = conn.execute(
-                "SELECT * FROM runs WHERE 用户ID=? ORDER BY 开始时间 DESC LIMIT ?",
-                (user_id, max(1, min(int(limit), 200)))).fetchall()
+            if user_id:
+                rows = conn.execute(
+                    "SELECT * FROM runs WHERE 用户ID=? ORDER BY 开始时间 DESC LIMIT ?",
+                    (user_id, limit)).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM runs ORDER BY 开始时间 DESC LIMIT ?", (limit,)).fetchall()
             return [dict(r) for r in rows]
 
     def add_usage_event(self, source: str, provider: str, model: str, unit: str, amount: int,

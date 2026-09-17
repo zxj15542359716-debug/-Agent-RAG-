@@ -1,9 +1,4 @@
 #数据库服务（SQLite）
-#【新增】把外部使用记录从 CSV 升级为关系数据库：用户/购买记录/维修记录三张表，
-#提供完整的增删改查；程序首次启动时若库为空，自动从 records.csv 导入初始数据。
-#选型说明：SQLite 零配置、单文件、Python 标准库自带 sqlite3，适合本地单进程应用；
-#表结构按 1个用户:N笔购买、1笔购买:N条维修 的一对多关系设计，外键开启级联删除，
-#删除用户时其购买与维修记录一并清理。
 import bcrypt
 import csv
 import hashlib
@@ -19,10 +14,6 @@ from utils.config_handler import agent_config
 from utils.path_tool import get_abs_path
 from utils.logger_handler import logger
 
-#【修改】密码哈希由"固定盐 + sha256"升级为 bcrypt：
-#原方案是单轮快哈希（GPU 每秒可尝试数十亿次），且盐硬编码在源码中；
-#bcrypt 自带随机盐、工作因子可调，专为抗离线暴力破解设计。
-#_PASSWORD_SALT 仅保留用于校验历史遗留的 sha256 哈希（登录成功后自动升级为 bcrypt）。
 _PASSWORD_SALT = "aftersales-salt"
 
 #建表语句：三张表，外键声明 ON DELETE CASCADE 配合 PRAGMA foreign_keys 实现级联删除
@@ -126,12 +117,7 @@ def _verify_password(password: str, stored: str) -> bool:
 
 
 class DatabaseService:
-    """SQLite 数据库服务：封装用户/购买/维修三张表的增删改查与登录校验。
-
-    - 首次初始化时自动建表；三张表为空则从 CSV 导入初始数据（只执行一次）
-    - 每次操作独立开连接：sqlite3 连接非线程安全，FastAPI 多线程下按操作开合最稳妥
-    - 初始化失败时置 self.error，供 ExternalRecordService 判断"数据源故障"
-    """
+    """SQLite 数据库服务：封装用户/购买/维修三张表的增删改查与登录校验"""
 
     def __init__(self, db_path: str | None = None, import_seed: bool = True) -> None:
         #数据库文件路径默认取配置文件，也允许测试时传入其他路径；
@@ -151,11 +137,7 @@ class DatabaseService:
     # ---------------- 基础设施 ----------------
 
     def _conn(self) -> sqlite3.Connection:
-        """新建一个连接（Row 工厂便于按列名取值），并开启外键约束（级联删除生效）。
-
-        【修复并发隐患】busy_timeout 设 10 秒：FastAPI 多线程下两个请求同时写库时，
-        后者最多等待 10 秒而不是立刻抛"database is locked"。
-        """
+        """新建一个连接（Row 工厂便于按列名取值），并开启外键约束（级联删除生效）"""
         conn = sqlite3.connect(self._db_path, timeout=10)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
@@ -164,12 +146,7 @@ class DatabaseService:
 
     @contextmanager
     def _tx(self):
-        """事务上下文：结束自动提交，并确保关闭连接。
-
-        【修复连接泄漏】sqlite3 连接自带 with 只提交/回滚事务、不关闭连接，
-        原写法每次操作泄漏一个连接与文件句柄，长期运行会耗尽句柄或残留锁；
-        统一改用本上下文：事务结束（提交）后 finally 关闭连接。
-        """
+        """事务上下文：结束自动提交，并确保关闭连接"""
         conn = self._conn()
         try:
             with conn:
@@ -183,11 +160,7 @@ class DatabaseService:
             conn.executescript(_SCHEMA)
 
     def _import_from_csv_if_empty(self) -> None:
-        """首次运行迁移：users 表为空时从 records.csv 导入初始数据。
-
-        CSV 表头：用户ID,密码,特征,外设类型,售后记录,购买时间；
-        售后记录内多条以 | 分隔，每条为"维修日期:损坏原因"，导入时拆进 repairs 表。
-        """
+        """首次运行迁移：users 表为空时从 records.csv 导入初始数据"""
         with self._tx() as conn:
             has_users = conn.execute("SELECT 1 FROM users LIMIT 1").fetchone()
             if has_users:

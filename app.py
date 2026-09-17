@@ -14,10 +14,17 @@
 #                  data: {"type":"tool_done","id":...}            工具执行完成（状态条变完成态）
 #                  data: {"type":"text","content":...}  模型回答 token 分片（前端逐字渐现）
 #                  data: {"type":"sources","items":[...]} 参考来源（第1步·引用溯源，回答后下发）
+#                  data: {"type":"node_start"/"node_end",...} 节点级进度（第2步·2.4，前端画时间线）
+#                  data: {"type":"report","data":{...}} 结构化售后报告（第2步·2.3，报告场景下发）
+#                  data: {"type":"run","run_id",...,"usage":{...}} 本轮汇总（第2步·2.4，含 token 账）
 #                  data: {"type":"error","content":...} 出错提示
 #                  data: {"type":"done"}                结束标记
+#  GET  /api/runs    运行历史（仅本人：路由/状态/耗时/token/结构化报告）
+#  GET  /api/usage   本人运行产生的用量汇总（口径：花了多少，不是账户还剩多少）
 import json
 import re
+import time
+from datetime import datetime, timedelta
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Request
@@ -32,7 +39,10 @@ from agent.orchestration.checkpoint import make_thread_id
 from service.auth_service import create_token, get_current_user
 from service.database_service import get_database_service
 from service.login_guard import get_login_guard
+from utils.config_handler import rag_config
 from utils.logger_handler import logger
+#【第2步·2.4】运行账：回调入账 + 账本生命周期 + 流水落库
+from utils.usage_ledger import UsageCallbackHandler, begin_run, end_run, persist_to_db
 
 #会话ID白名单：前端为 crypto.randomUUID()（36 位十六进制+短横线）。
 #【第2步·2.1】它会被拼进 checkpointer 的 thread_id，放任客户端传任意字符串
@@ -75,6 +85,25 @@ class ChatRequest(BaseModel):
     #【修改】原 user_id 字段已删除：用户身份改由 Authorization: Bearer <token> 提供
     #（见 get_current_user 依赖）——请求体自报身份正是越权漏洞的根源
 
+def _safe_db(fn, what: str) -> None:
+    """运行账/用量流水落库的统一入口：失败只记日志。
+
+    记账再重要也不该影响回答——这是第 2 步对"可观测性"的一贯口径（见 usage_ledger.py 说明）。
+    """
+    try:
+        fn()
+    except Exception as e:
+        logger.warning(f"[usage]{what}失败（不影响回答）：{e}")
+
+
+def _ts_to_text(ms: int | None) -> str:
+    """事件里的毫秒时间戳（ts）转成本项目统一的时间文本"""
+    try:
+        return datetime.fromtimestamp(int(ms or 0) / 1000).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return ""
+
+
 def stream_events(query: str, session_id: str = "", user_id: str = ""):
     """以事件字典迭代 Agent 流式输出：区分工具调用状态与回答文本。
 
@@ -100,6 +129,12 @@ def stream_events(query: str, session_id: str = "", user_id: str = ""):
 
     【第2步·2.1 子图流式】日常问答由编排图的 normal 节点委托给既有 ReAct Agent 执行，
     因此 stream 必须开 subgraphs=True，否则收不到子图的 token 分片（只剩一条聚合消息）。
+
+    【第2步·2.4 运行账】本轮对话即一次 run：
+      - 节点事件（node_start/node_end）落 run_nodes，流末尾汇总一条 run 事件（含 token 账）；
+      - 模型用量由 UsageCallbackHandler 回调入账（覆盖工具内部调用与并行子研究者），
+        DashScope 的嵌入/重排由调用点显式入账（usage_ledger）；
+      - 无论成功失败都写 runs（失败也要留痕），写库失败只记日志、绝不影响回答。
     """
     agent = get_agent()
     #【第2步·2.1】会话线程键：与原 mem_key 同一个隔离键（用户ID:会话ID），
@@ -108,6 +143,18 @@ def stream_events(query: str, session_id: str = "", user_id: str = ""):
     #【第1步·1.4】溯源收集容器：挂在运行时上下文里，rag_summarize 工具检索后把来源追加进来，
     #流正常结束时统一下发（sources 事件）；工具在容器缺失时静默跳过
     sources_sink: list = []
+    #【第2步·2.4】本轮运行账：账本在请求线程开启（ContextVar 随后被 LangGraph 复制到各节点线程），
+    #回调处理器挂在 config 上，贯穿 Agent/工具内部/并行子研究者的全部模型调用
+    run_id = uuid4().hex
+    run_started = time.time()
+    recorder = begin_run(run_id, "chat")
+    usage_handler = UsageCallbackHandler()
+    node_starts: dict[str, dict] = {}      #node_start 事件按 id 缓存，node_end 时配对落库
+    node_seq = 0
+    chunk_usage: list[dict] = []           #兜底用量：回调拿不到时用消息分片里的 usage 补齐
+    error_flag = False
+    db = get_database_service()
+    _safe_db(lambda: db.start_run(run_id, user_id, _safe_session_id(session_id), query), "运行记录")
     #【第2步·2.1】只发本轮新消息：历史由 checkpointer 从 SQLite 读回并与本轮合并
     input_dict = {"messages": [{"role": "user", "content": query}], "query": query}
     seen_tool_indices: set = set()   #记录已上报过的工具调用序号，避免一个调用报多次
@@ -130,16 +177,32 @@ def stream_events(query: str, session_id: str = "", user_id: str = ""):
         #【新增】current_user 注入登录用户ID，工具据此默认查询登录者本人的数据
         for ns, mode, payload in agent.graph.stream(
             input_dict, stream_mode=["messages", "custom"], subgraphs=True,
-            config={"configurable": {"thread_id": thread_id}},
+            config={"configurable": {"thread_id": thread_id}, "callbacks": [usage_handler]},
             context={"report": False, "current_user": user_id, "sources": sources_sink}):
             #自定义事件直接透传：事件字典的形状本就是前端消费的形状
             #（node_start/node_end/report/text，见 agent/orchestration/events.py 的事件契约）
             if mode == "custom":
                 if isinstance(payload, dict) and payload.get("type"):
+                    #【第2步·2.4】节点事件同步落 run_nodes（时间线的"可回看版"）
+                    if payload["type"] == "node_start":
+                        node_starts[payload.get("id", "")] = payload
+                    elif payload["type"] == "node_end":
+                        started = node_starts.pop(payload.get("id", ""), {})
+                        node_seq += 1
+                        seq_now, ev = node_seq, payload
+                        _safe_db(lambda: db.add_run_node(
+                            run_id=run_id, node=ev.get("node", ""), seq=seq_now,
+                            status=ev.get("status", "ok"), started_at=_ts_to_text(started.get("ts")),
+                            duration_ms=int(ev.get("duration_ms", 0) or 0), kind=ev.get("kind", ""),
+                            label=ev.get("label", ""), detail=ev.get("summary", "")), "节点记录")
                     yield payload
                 continue
 
             chunk, meta = payload
+            #兜底用量：分片自带 usage（流式末片）时先攒着，回调若也拿到了则不重复计入
+            usage_md = getattr(chunk, "usage_metadata", None)
+            if usage_md:
+                chunk_usage.append(usage_md)
             #【第2步·2.3】命名空间顶层段：'normal'=日常问答子图，'researcher'=报告分支的子研究者
             top = ns[0].split(":")[0] if ns else ""
 
@@ -205,8 +268,42 @@ def stream_events(query: str, session_id: str = "", user_id: str = ""):
             yield {"type": "sources", "items": sources_sink}
     except Exception as e:
         #异常只进日志，返回给前端的是友好提示
+        error_flag = True
         logger.error(f"[web]对话流异常：{str(e)}", exc_info=True)
         yield {"type": "error", "content": "服务暂时不可用，请稍后再试。"}
+
+    #【第2步·2.4】收尾（正常与异常路径都会走到；前端断开时生成器被关闭、这里不执行——
+    # 断线场景不做额外 IO，避免与 GeneratorExit 相关的报错）：
+    #   ① 兜底用量：回调一次都没拿到（接口不返回 usage）时，用消息分片里的 usage 补齐；
+    #   ② 汇总 run 事件下发（前端在时间线底部显示"本轮 N tokens · X 秒"）；
+    #   ③ 写 runs（含结构化报告）与 usage_events 流水；④ 释放账本。
+    if recorder.llm_calls == 0 and chunk_usage:
+        for usage_md in chunk_usage:
+            recorder.add_llm("model", usage_md)
+    if not (recorder.llm_calls or recorder.embedding_tokens or recorder.rerank_calls):
+        recorder.note("usage_unavailable")     #一轮下来一条用量都没拿到，如实标注（前端不显示 token 行）
+    snapshot = recorder.snapshot()
+    duration_ms = int((time.time() - run_started) * 1000)
+    route, report = "", None
+    try:
+        state = agent.graph.get_state({"configurable": {"thread_id": thread_id}})
+        route = (state.values or {}).get("route", "") or ""
+        report = (state.values or {}).get("report")
+    except Exception as e:
+        logger.debug(f"[usage]读取最终状态失败（不影响回答）：{e}")
+    status = "error" if error_flag else "ok"
+    yield {"type": "run", "run_id": run_id, "route": route, "status": status,
+           "duration_ms": duration_ms,
+           "usage": {"input_tokens": snapshot["input_tokens"], "output_tokens": snapshot["output_tokens"],
+                     "total_tokens": snapshot["total_tokens"], "llm_calls": snapshot["llm_calls"],
+                     "embedding_tokens": snapshot["embedding_tokens"],
+                     "rerank_tokens": snapshot["rerank_tokens"], "rerank_calls": snapshot["rerank_calls"]}}
+    _safe_db(lambda: db.finish_run(run_id, status, duration_ms, snapshot,
+                                   json.dumps(report, ensure_ascii=False) if report else None,
+                                   "；".join(snapshot["notes"]), route), "运行收尾")
+    _safe_db(lambda: persist_to_db(db, recorder, rag_config["chat_model_name"],
+                                   rag_config["embedding_model_name"]), "用量流水")
+    end_run()
 
 class LoginRequest(BaseModel):
     user_id: str
@@ -306,6 +403,28 @@ def chat(payload: ChatRequest, user_id: str = Depends(get_current_user)):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+@app.get("/api/runs")
+def api_runs(limit: int = 20, user_id: str = Depends(get_current_user)):
+    """运行历史（仅本人）：每轮对话的路由/状态/耗时/token 账与结构化报告。
+
+    身份一律取自登录 token，不接受前端传 user_id；SQL 里强制按用户过滤（与第 0 步口径一致）。
+    """
+    items = get_database_service().list_runs(user_id, limit)
+    return {"ok": True, "items": items}
+
+
+@app.get("/api/usage")
+def api_usage(days: int = 7, user_id: str = Depends(get_current_user)):
+    """本人运行产生的用量汇总（按来源/提供方/模型/单位）。
+
+    口径提醒：这里统计的是"本人运行花了多少"，不含重建索引等离线脚本的消耗；
+    它回答不了"账户还剩多少免费额度"——那只能去阿里云百炼控制台看（README 亦写明）。
+    """
+    since = (datetime.now() - timedelta(days=max(1, min(days, 90)))).strftime("%Y-%m-%d %H:%M:%S")
+    items = get_database_service().usage_summary(user_id=user_id, since=since)
+    return {"ok": True, "since": since, "items": items}
+
 
 @app.get("/", response_class=HTMLResponse)
 def index():
@@ -1089,5 +1208,34 @@ if __name__ == "__main__":
 #   1) .venv/Scripts/python.exe -m pytest tests/test_checkpoint_memory.py tests/test_session_memory_deprecated.py
 #   2) 起服务聊两句 → Ctrl+C 重启 → 同一标签页继续问"那键盘呢"，回答应能接上上文；
 #      换账号用同一 session_id 提问，上下文应为空（隔离性）。
+# ============================================================================================
+
+# ============================================================================================
+# 【第 2 步 · 2.4 说明】节点事件落库与 token 成本记账（本文件的改动说明）
+# --------------------------------------------------------------------------------------------
+# 改动点（共 6 处）：
+#   1. 流消费改为双模式 stream_mode=["messages","custom"]：自定义事件（node_start/node_end/
+#      report/text）原样透传给前端，messages 模式仍是打字机与工具状态条的老逻辑。
+#   2. 每轮对话生成 run_id，begin_run 开账本、UsageCallbackHandler 挂进 config.callbacks
+#      ——它是"用量算得全"的关键：Agent 本体、工具内部的 LLM 调用（rag_summarize 的总结）、
+#      三个并行子研究者、合成器，全部经这一条回调入账。
+#   3. node_start/node_end 事件同步写 run_nodes 表（时间线的可回看版：节点/状态/耗时/摘要）。
+#   4. 流末尾下发 run 事件（run_id/路由/状态/耗时/分项 token），前端在时间线底部显示成本行。
+#   5. 收尾写 runs（含结构化报告 JSON）与 usage_events 流水；异常路径同样收尾，保证不漏账。
+#   6. 新增 GET /api/runs 与 GET /api/usage：身份取自登录 token、SQL 强制按用户过滤。
+# 为什么记账挂在回调而不是在每个调用点手写：见 utils/usage_ledger.py 底部说明。
+# 边界与兜底：
+#   - 回调一次都没拿到 usage 时，用消息分片里的 usage 兜底；两条都不通就写 usage_unavailable，
+#     前端不显示 token 行（功能降级，不影响回答）；
+#   - 所有写库都走 _safe_db：失败只记日志；
+#   - 前端断开（生成器被关闭）时不做收尾 IO，这一条运行记录会停在 running 状态——
+#     这是"断线不额外 IO"的有意取舍，由 usage_report 的输出口径说明。
+# 与其它文件的关系：
+#   utils/usage_ledger.py 提供账本与回调；service/database_service.py 提供三张表与 CRUD；
+#   agent/orchestration/{events,nodes}.py 负责发事件与标记阶段（scope）。
+# 验证方式：
+#   1) .venv/Scripts/python.exe -m pytest（59 用例，含 test_usage_ledger / test_run_history）
+#   2) 起服务问一句 → python -m scripts.usage_report --days 1 应看到本轮用量；
+#      GET /api/runs 能看到该轮的节点明细与 token 账。
 # ============================================================================================
 

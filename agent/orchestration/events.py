@@ -53,7 +53,9 @@ def node_span(node: str, label: str, kind: str = "", depth: int = 0):
         info["summary"] = f"{type(e).__name__}: {e}"[:200]
         raise
     finally:
-        emit({"type": NODE_END, "id": span_id, "node": node, "kind": kind,
+        #结束事件同样带 label/kind：前端按 id 配对后直接用结束事件渲染即可，
+        #不必回查开始事件（实测漏带 label 时时间线只能显示内部节点名）
+        emit({"type": NODE_END, "id": span_id, "node": node, "kind": kind, "label": label,
               "status": info["status"], "summary": info["summary"],
               "duration_ms": int((time.time() - started) * 1000)})
 

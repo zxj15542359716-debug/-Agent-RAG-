@@ -97,3 +97,31 @@ def test_register_password_min_length(client_and_db):
     data = client.post("/api/register", json={"password": "123456"}).json()
     assert data["ok"] is True
     assert len(data["user_id"]) == 4
+
+
+# ---------- 第2步·2.4：运行历史与用量接口（同样是"身份取自 token"口径） ----------
+
+def test_runs_and_usage_require_token(auth_client):
+    """无凭证访问运行历史 / 用量汇总：401"""
+    client, _ = auth_client
+    assert client.get("/api/runs").status_code == 401
+    assert client.get("/api/usage").status_code == 401
+
+
+def test_runs_only_returns_own_records(auth_client):
+    """运行历史只返回本人记录：即使用别人的 run_id 也查不到（SQL 强制按登录用户过滤）"""
+    client, db = auth_client
+    db.start_run("run-of-2483", "2483", "s1", "我的问题")
+    db.start_run("run-of-9999", "9999", "s1", "别人的问题")
+    token = login(client, "2483", "pw123456").json()["token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    items = client.get("/api/runs", headers=headers).json()["items"]
+    assert [r["run_id"] for r in items] == ["run-of-2483"]
+    #用量汇总同样只看得到本人的流水
+    db.add_usage_event(source="chat", provider="deepseek", model="deepseek-v4-pro",
+                       unit="token", amount=321, run_id="run-of-2483")
+    db.add_usage_event(source="chat", provider="deepseek", model="deepseek-v4-pro",
+                       unit="token", amount=999, run_id="run-of-9999")
+    usage = client.get("/api/usage", headers=headers).json()["items"]
+    assert sum(u["amount"] for u in usage) == 321

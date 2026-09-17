@@ -14,6 +14,7 @@ from agent.orchestration.researchers import SPECS, get_spec, run_researcher
 from agent.orchestration.router import ROUTE_REPORT, classify_intent
 from model.fectory import chat_model
 from utils.Prompt_loader import load_report_synthesize_prompt
+from utils.usage_ledger import scope
 from utils.config_handler import orchestration_config
 from utils.logger_handler import logger
 
@@ -78,7 +79,7 @@ def make_normal_node(react_agent):
 
     def normal(state: dict, runtime: Runtime) -> dict:
         #事件跨度覆盖整段问答（含工具调用），前端时间线里显示为"智能问答 · 3.2s"
-        with node_span("normal", "智能问答") as span:
+        with scope("normal"), node_span("normal", "智能问答") as span:
             result = react_agent.agent.invoke(
                 {"messages": state["messages"]},
                 #context 为空时给空字典兜底：内层中间件会直接 .get("report")，
@@ -115,7 +116,7 @@ def researcher(state: dict, runtime: Runtime) -> dict:
     """
     kind = state["kind"]
     spec = get_spec(kind)
-    with node_span("researcher", spec.label, kind=kind, depth=1) as span:
+    with scope(kind), node_span("researcher", spec.label, kind=kind, depth=1) as span:
         data, status = run_researcher(kind, state.get("query", ""), runtime.context)
         span["status"] = status
         span["summary"] = _finding_summary(kind, data, status)
@@ -221,7 +222,7 @@ def synthesize(state: dict, runtime: Runtime) -> dict:
     finding_map = {spec.state_key: state.get(spec.state_key) for spec in SPECS.values()}
     sources = (runtime.context or {}).get("sources") or []
     query = state.get("query") or ""
-    with node_span("synthesize", "生成报告") as span:
+    with scope("synthesize"), node_span("synthesize", "生成报告") as span:
         report, note = synthesize_report(finding_map, sources, query)
         text = render_report_text(report)
         span["summary"] = note

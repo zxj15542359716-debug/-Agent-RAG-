@@ -51,12 +51,68 @@ CREATE TABLE IF NOT EXISTS reports (
     故障描述 TEXT NOT NULL,
     上报时间 TEXT NOT NULL
 );
+-- 【第2步·2.4】运行历史三表：runs（每轮对话一行）/ run_nodes（节点级明细）/ usage_events（计量流水）
+-- 说明：runs.user_id 故意不建外键——运行历史是审计账，用户被删也不该让账目消失（与业务表口径不同）
+CREATE TABLE IF NOT EXISTS runs (
+    run_id      TEXT PRIMARY KEY,
+    用户ID      TEXT NOT NULL,
+    会话ID      TEXT NOT NULL DEFAULT '',
+    问题        TEXT NOT NULL DEFAULT '',
+    路由        TEXT NOT NULL DEFAULT '',
+    状态        TEXT NOT NULL DEFAULT 'running',
+    开始时间    TEXT NOT NULL,
+    结束时间    TEXT,
+    耗时毫秒    INTEGER DEFAULT 0,
+    输入tokens  INTEGER DEFAULT 0,
+    输出tokens  INTEGER DEFAULT 0,
+    总tokens    INTEGER DEFAULT 0,
+    嵌入tokens  INTEGER DEFAULT 0,
+    重排tokens  INTEGER DEFAULT 0,
+    重排次数    INTEGER DEFAULT 0,
+    报告JSON    TEXT,
+    备注        TEXT
+);
+CREATE TABLE IF NOT EXISTS run_nodes (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id      TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+    序号        INTEGER NOT NULL DEFAULT 0,
+    节点        TEXT NOT NULL,
+    类型        TEXT DEFAULT '',
+    标签        TEXT DEFAULT '',
+    状态        TEXT NOT NULL DEFAULT 'ok',
+    开始时间    TEXT NOT NULL,
+    耗时毫秒    INTEGER DEFAULT 0,
+    输入tokens  INTEGER DEFAULT 0,
+    输出tokens  INTEGER DEFAULT 0,
+    总tokens    INTEGER DEFAULT 0,
+    命名空间    TEXT DEFAULT '',
+    摘要        TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS usage_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    时间        TEXT NOT NULL,
+    来源        TEXT NOT NULL,
+    提供方      TEXT NOT NULL,
+    模型        TEXT NOT NULL,
+    单位        TEXT NOT NULL,
+    数量        INTEGER NOT NULL,
+    run_id      TEXT,
+    备注        TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_runs_user_time ON runs(用户ID, 开始时间 DESC);
+CREATE INDEX IF NOT EXISTS idx_run_nodes_run ON run_nodes(run_id, 序号);
+CREATE INDEX IF NOT EXISTS idx_usage_events_ts ON usage_events(时间 DESC);
 """
 
 
 def _hash_password(password: str) -> str:
     """密码哈希：bcrypt（自带随机盐）；按 72 字节截断（bcrypt 算法输入上限）"""
     return bcrypt.hashpw(password.encode("utf-8")[:72], bcrypt.gensalt()).decode("utf-8")
+
+
+def _now() -> str:
+    """统一时间戳格式（与既有上报时间口径一致：YYYY-MM-DD HH:MM:SS）"""
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _verify_password(password: str, stored: str) -> bool:
@@ -203,7 +259,103 @@ class DatabaseService:
                 "purchases": conn.execute("SELECT COUNT(*) FROM purchases").fetchone()[0],
                 "repairs": conn.execute("SELECT COUNT(*) FROM repairs").fetchone()[0],
                 "reports": conn.execute("SELECT COUNT(*) FROM reports").fetchone()[0],
+                #【第2步·2.4】运行历史三表（自检与演示时一眼能看到"账有没有在记"）
+                "runs": conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0],
+                "run_nodes": conn.execute("SELECT COUNT(*) FROM run_nodes").fetchone()[0],
+                "usage_events": conn.execute("SELECT COUNT(*) FROM usage_events").fetchone()[0],
             }
+
+    # ---------------- 运行历史 / 用量账（第2步·2.4） ----------------
+    # 设计口径：
+    #   1. 一轮对话 = 一条 runs；每个节点事件 = 一条 run_nodes；每次计量 = 一条 usage_events。
+    #   2. 写账失败绝不能影响回答：调用方（app.py / usage_ledger）统一捕获异常只记日志。
+    #   3. 所有查询都按 用户ID 过滤（在 SQL 里强制），不接受前端传 user_id——与第 0 步口径一致。
+
+    def start_run(self, run_id: str, user_id: str, session_id: str, query: str, route: str = "") -> None:
+        """开始一轮运行：先落一条 running 记录，结束时用 finish_run 补全"""
+        with self._tx() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO runs (run_id, 用户ID, 会话ID, 问题, 路由, 状态, 开始时间) "
+                "VALUES (?, ?, ?, ?, ?, 'running', ?)",
+                (run_id, user_id, session_id, query, route, _now()))
+
+    def finish_run(self, run_id: str, status: str, duration_ms: int, usage: dict | None = None,
+                   report_json: str | None = None, detail: str = "", route: str = "") -> None:
+        """结束一轮运行：写状态、耗时与 token 汇总（异常路径也要调用，保证不漏账）。
+
+        路由在这里一并补写：路由是 classify 节点跑完才知道的（start_run 时还没算出来）。
+        """
+        usage = usage or {}
+        with self._tx() as conn:
+            #路由用 NULLIF 兜一下：传空串时保留 start_run 已写入的值，避免"收尾把已知路由抹掉"
+            conn.execute(
+                "UPDATE runs SET 状态=?, 结束时间=?, 耗时毫秒=?, 输入tokens=?, 输出tokens=?, "
+                "总tokens=?, 嵌入tokens=?, 重排tokens=?, 重排次数=?, 报告JSON=?, 备注=?, "
+                "路由=COALESCE(NULLIF(?, ''), 路由) WHERE run_id=?",
+                (status, _now(), int(duration_ms),
+                 int(usage.get("input_tokens", 0)), int(usage.get("output_tokens", 0)),
+                 int(usage.get("total_tokens", 0)), int(usage.get("embedding_tokens", 0)),
+                 int(usage.get("rerank_tokens", 0)), int(usage.get("rerank_calls", 0)),
+                 report_json, detail, route, run_id))
+
+    def add_run_node(self, run_id: str, node: str, seq: int, status: str, started_at: str,
+                     duration_ms: int = 0, kind: str = "", label: str = "", ns: str = "",
+                     usage: dict | None = None, detail: str = "") -> None:
+        """记录一个节点的执行明细（时间线落库版）"""
+        usage = usage or {}
+        with self._tx() as conn:
+            conn.execute(
+                "INSERT INTO run_nodes (run_id, 序号, 节点, 类型, 标签, 状态, 开始时间, 耗时毫秒, "
+                "输入tokens, 输出tokens, 总tokens, 命名空间, 摘要) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (run_id, seq, node, kind, label, status, started_at, int(duration_ms),
+                 int(usage.get("input_tokens", 0)), int(usage.get("output_tokens", 0)),
+                 int(usage.get("total_tokens", 0)), ns, detail))
+
+    def get_run(self, run_id: str, user_id: str) -> dict | None:
+        """按运行号取一条运行 + 其节点明细；非本人运行返回 None（越权防护）"""
+        with self._tx() as conn:
+            row = conn.execute("SELECT * FROM runs WHERE run_id=? AND 用户ID=?", (run_id, user_id)).fetchone()
+            if row is None:
+                return None
+            run = dict(row)
+            nodes = conn.execute(
+                "SELECT * FROM run_nodes WHERE run_id=? ORDER BY 序号, id", (run_id,)).fetchall()
+            run["nodes"] = [dict(n) for n in nodes]
+            return run
+
+    def list_runs(self, user_id: str, limit: int = 20) -> list[dict]:
+        """列出某用户最近的运行记录（不含节点明细）"""
+        with self._tx() as conn:
+            rows = conn.execute(
+                "SELECT * FROM runs WHERE 用户ID=? ORDER BY 开始时间 DESC LIMIT ?",
+                (user_id, max(1, min(int(limit), 200)))).fetchall()
+            return [dict(r) for r in rows]
+
+    def add_usage_event(self, source: str, provider: str, model: str, unit: str, amount: int,
+                        run_id: str | None = None, note: str = "") -> None:
+        """记一条用量流水（chat / reindex / eval 等来源；单位是 token 或 call）"""
+        with self._tx() as conn:
+            conn.execute(
+                "INSERT INTO usage_events (时间, 来源, 提供方, 模型, 单位, 数量, run_id, 备注) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (_now(), source, provider, model, unit, int(amount), run_id, note))
+
+    def usage_summary(self, user_id: str | None = None, since: str | None = None) -> list[dict]:
+        """按（来源/提供方/模型/单位）汇总用量；传 user_id 时只统计该用户运行产生的用量"""
+        sql = ("SELECT 来源 AS source, 提供方 AS provider, 模型 AS model, 单位 AS unit, "
+               "SUM(数量) AS amount, COUNT(*) AS events FROM usage_events")
+        where, params = [], []
+        if since:
+            where.append("时间 >= ?")
+            params.append(since)
+        if user_id:
+            where.append("run_id IN (SELECT run_id FROM runs WHERE 用户ID = ?)")
+            params.append(user_id)
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " GROUP BY 来源, 提供方, 模型, 单位 ORDER BY amount DESC"
+        with self._tx() as conn:
+            return [dict(r) for r in conn.execute(sql, params).fetchall()]
 
     # ---------------- 用户表 CRUD ----------------
 
@@ -463,3 +615,23 @@ if __name__ == "__main__":
     print("删除上报:", svc.delete_report(rep_id))
     print("删除注册用户:", svc.delete_user(new_id))
     print("各表行数:", svc.counts())
+
+
+# ============================================================================================
+# 【第 2 步 · 2.4 说明】运行历史与用量账（本文件的改动说明）
+# --------------------------------------------------------------------------------------------
+# 改动点：_SCHEMA 新增三张表（runs / run_nodes / usage_events + 三个索引），counts() 补三表行数，
+# 并新增对应 CRUD：start_run / finish_run / add_run_node / get_run / list_runs /
+# add_usage_event / usage_summary。
+# 为什么放业务库而不是单独的库：这三张表是"业务运行账"，与用户/购买/维修同源同生命周期，
+# 放一起便于 SQL 联查（如"某用户的某次运行花了多少 token"），也不需要额外的连接管理。
+# 与 checkpointer 的库分开（data/database/checkpoints.db）的原因见 checkpoint.py：那张库的表
+# 结构归 LangGraph 管，版本随库升级而变，不跟业务表混。
+# 为什么 runs.user_id 不建外键：运行历史是审计账，用户被注销不该让账目连带消失——
+# 与业务表（级联删除）是两种口径，故意区别对待。
+# 安全口径：所有查询方法都要求"用户ID"参数并在 SQL 里强制过滤，get_run 命中不了就返回 None；
+# 接口层（app.py）不允许前端传 user_id，身份一律取登录 token（与第 0 步一致）。
+# 失败口径：写账/查账异常由调用方捕获后只记日志——记账再重要也不能影响回答。
+# 验证：.venv/Scripts/python.exe -m service.database_service（自检，含三张新表）
+#       .venv/Scripts/python.exe -m pytest tests/test_run_history.py
+# ============================================================================================

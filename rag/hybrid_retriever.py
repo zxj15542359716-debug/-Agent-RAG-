@@ -13,6 +13,8 @@ from rag.chunk_store import ChunkStore
 from rag.vector_store import VectorStoreService
 from utils.config_handler import retrieval_config
 from utils.logger_handler import logger
+#【第2步·2.4】重排用量记账（DashScope SDK 不走 LangChain 回调，需在调用点显式入账）
+from utils.usage_ledger import record_rerank, usage_tokens
 
 
 def _tokenize(text: str) -> list[str]:
@@ -168,6 +170,9 @@ class HybridRetriever:
         if resp.status_code != 200:
             raise RuntimeError(f"DashScope 重排接口返回 {resp.status_code}："
                                f"{getattr(resp, 'code', '')} {getattr(resp, 'message', '')}")
+        #【第2步·2.4】重排是按"query + 候选集"计费的独立用量，记进当前运行的账本：
+        #重排模型与嵌入模型各有独立免费额度，不记这笔账就说不清"额度花在哪了"
+        record_rerank(usage_tokens(getattr(resp, "usage", None)), calls=1)
         out: list[RetrievedChunk] = []
         for r in resp.output.results:
             c = candidates[r.index]

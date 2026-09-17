@@ -18,18 +18,29 @@
 #                  data: {"type":"done"}                结束标记
 import json
 import re
+from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 from langchain_core.messages import AIMessageChunk, ToolMessage
 
-from agent.react_agent import ReactAgent
+#【第2步·2.1】对话入口由"单 ReAct"换成编排图（OrchestratorAgent）：
+#编排图内部仍复用既有 ReactAgent 作为日常问答分支（行为零变化），并挂上 SqliteSaver 会话持久化
+from agent.orchestration import OrchestratorAgent
+from agent.orchestration.checkpoint import make_thread_id
 from service.auth_service import create_token, get_current_user
 from service.database_service import get_database_service
 from service.login_guard import get_login_guard
-from service.session_memory_service import get_session_memory_service
 from utils.logger_handler import logger
+
+#会话ID白名单：前端为 crypto.randomUUID()（36 位十六进制+短横线）。
+#【第2步·2.1】它会被拼进 checkpointer 的 thread_id，放任客户端传任意字符串
+#等于把"会话键"的构造权交出去，因此非法值一律当"无会话"处理
+_SESSION_ID_RE = re.compile(r"[A-Za-z0-9\-]{8,64}")
+
+def _safe_session_id(session_id: str) -> str:
+    return session_id if session_id and _SESSION_ID_RE.fullmatch(session_id) else ""
 
 app = FastAPI(title="电脑外设智能售后")
 
@@ -49,11 +60,11 @@ _ALLOWED_DEVICE_TYPES = ("键盘", "耳机", "鼠标")
 #Agent 惰性单例：首次对话时才构建（构建图不发 API 请求，但避免重复构建）
 _agent = None
 
-def get_agent() -> ReactAgent:
+def get_agent() -> OrchestratorAgent:
     global _agent
     if _agent is None:
-        logger.info("[web]首次构建 ReactAgent")
-        _agent = ReactAgent()
+        logger.info("[web]首次构建 OrchestratorAgent（编排图）")
+        _agent = OrchestratorAgent()
     return _agent
 
 class ChatRequest(BaseModel):
@@ -67,9 +78,12 @@ class ChatRequest(BaseModel):
 def stream_events(query: str, session_id: str = "", user_id: str = ""):
     """以事件字典迭代 Agent 流式输出：区分工具调用状态与回答文本。
 
-    【新增】临时会话记忆：按 session_id 从内存会话存储取出最近 N 轮历史，
-    与本次问题拼成完整 messages 一起送入模型，多轮对话因此更连贯（如"那键盘呢"）；
-    流正常结束后把本轮问答写回存储，出错则不写，重试时不带残缺上下文。
+    【第2步·2.1 会话持久化】会话历史改由 LangGraph checkpointer 落 SQLite：
+    按 thread_id="用户ID:会话ID" 读写（与原内存记忆同一个隔离键），本轮只发送新增的
+    这一条用户消息，历史由 checkpointer 在服务端拼好——因此进程重启后同一会话仍能接上。
+    session_id 为空或格式非法（旧前端）时用一次性线程，等价于改造前的"无记忆单轮问答"。
+    已知行为差异：本轮用户消息在请求开始时就已入库，若中途出错，历史里会留下一条没有
+    回答的提问（改造前是整轮都不写）；这是 checkpoint 机制的固有语义，重试不影响下一轮。
 
     【修改】stream_mode 由 values 改为 messages：模型输出按 token 逐块下发，
     前端实现打字机式流式显示；工具调用通过 tool_call_chunks 识别（首个带 name 的分片）。
@@ -83,38 +97,39 @@ def stream_events(query: str, session_id: str = "", user_id: str = ""):
     【新增】工具完成事件：工具执行完毕 ToolMessage 返回时下发 tool_done（带 tool_call_id），
     前端据此把对应状态条从"正在调用"改为"已调用"并停止呼吸动画。修复此前"结果已经
     出来但工具提示条仍在转"的显示问题（工具条创建后永不结束、done 事件前端未处理）。
+
+    【第2步·2.1 子图流式】日常问答由编排图的 normal 节点委托给既有 ReAct Agent 执行，
+    因此 stream 必须开 subgraphs=True，否则收不到子图的 token 分片（只剩一条聚合消息）。
     """
     agent = get_agent()
-    memory = get_session_memory_service()
-    #【修改】会话记忆按"登录用户 + 会话ID"隔离：原实现只认前端生成的 session_id，
-    #拿到他人 session_id 即可续读其对话历史；加用户前缀后不同用户天然隔离
-    mem_key = f"{user_id}:{session_id}" if session_id else ""
-    #历史消息 + 本次问题拼成完整输入；session_id 为空（旧前端）则退化为无记忆单轮问答
-    history = memory.get_history(mem_key) if mem_key else []
+    #【第2步·2.1】会话线程键：与原 mem_key 同一个隔离键（用户ID:会话ID），
+    #不同用户即使拿到同一 session_id 也读不到对方历史；无会话ID时用一次性线程保证"无记忆"语义
+    thread_id = make_thread_id(user_id, _safe_session_id(session_id)) or f"ephemeral:{uuid4().hex}"
     #【第1步·1.4】溯源收集容器：挂在运行时上下文里，rag_summarize 工具检索后把来源追加进来，
     #流正常结束时统一下发（sources 事件）；工具在容器缺失时静默跳过
     sources_sink: list = []
-    input_dict = {"messages": [*history, {"role": "user", "content": query}]}
+    #【第2步·2.1】只发本轮新消息：历史由 checkpointer 从 SQLite 读回并与本轮合并
+    input_dict = {"messages": [{"role": "user", "content": query}], "query": query}
     seen_tool_indices: set = set()   #记录已上报过的工具调用序号，避免一个调用报多次
     seen_tool_done_ids: set = set()  #记录已下发 tool_done 的 tool_call_id，避免工具返回分片时重复下发
     cur_msg_id = None                #当前消息 id（用于划分消息边界）
     cur_msg_has_tool = False         #当前消息是否发起过工具调用（是则其文本作废）
-    cur_msg_text: list[str] = []     #当前消息已下发的文本（消息结束时判断是否计入最终回答）
-    answer_parts: list[str] = []     #收集最终回答文本（正常结束后写入会话记忆）
 
-    def settle_message() -> None:
-        """消息结束时结算：带工具调用的消息文本作废；否则计入最终回答"""
-        nonlocal cur_msg_text, cur_msg_has_tool
-        if cur_msg_text and not cur_msg_has_tool:
-            answer_parts.append("".join(cur_msg_text))
-        cur_msg_text = []
+    def start_new_message() -> None:
+        """消息边界：重置"本条消息是否发起过工具调用"标记
+        （工具调用的 index 在每条消息内都从 0 计，跨消息不复位会把新调用误判为已上报）"""
+        nonlocal cur_msg_has_tool
         cur_msg_has_tool = False
 
     try:
+        #【第2步·2.1】改走编排图：流项形状为 (命名空间, (消息分片, 元数据))，
+        #subgraphs=True 必须开（日常问答在子 Agent 里执行，不开收不到逐字分片）；
+        #config 里的 thread_id 决定本次对话读写哪条会话（checkpointer 据此续接历史）
         #context 与 react_agent.execute_stream 保持一致（middleware 依赖 runtime.context["report"]）；
         #【新增】current_user 注入登录用户ID，工具据此默认查询登录者本人的数据
-        for chunk, meta in agent.agent.stream(
-            input_dict, stream_mode="messages",
+        for _ns, (chunk, meta) in agent.graph.stream(
+            input_dict, stream_mode="messages", subgraphs=True,
+            config={"configurable": {"thread_id": thread_id}},
             context={"report": False, "current_user": user_id, "sources": sources_sink}):
             #工具执行完成（ToolMessage 返回）：下发 tool_done，前端把对应状态条标记为完成；
             #按 tool_call_id 去重（部分框架版本工具返回可能拆成多个分片）
@@ -135,7 +150,7 @@ def stream_events(query: str, session_id: str = "", user_id: str = ""):
             #消息边界：结算上一条消息；工具调用的 index 在每条消息内都从0计，
             #跨消息会误判重复，此处清空去重集合，确保每条消息的工具调用都能上报
             if chunk.id and cur_msg_id is not None and chunk.id != cur_msg_id:
-                settle_message()
+                start_new_message()
                 seen_tool_indices.clear()
             if chunk.id:
                 cur_msg_id = chunk.id
@@ -150,7 +165,6 @@ def stream_events(query: str, session_id: str = "", user_id: str = ""):
                     seen_tool_indices.add(idx)
                     if not cur_msg_has_tool:
                         cur_msg_has_tool = True   #标记本条消息带工具调用，后续文本不再下发
-                        cur_msg_text.clear()      #本消息已下发的文本作废
                         yield {"type": "clear"}   #通知前端清空当前气泡、重新显示思考圈
                     label = _TOOL_LABELS.get(name, name)
                     #带上 tool_call_id，前端据此把 tool_done 事件匹配到对应状态条
@@ -161,16 +175,11 @@ def stream_events(query: str, session_id: str = "", user_id: str = ""):
             content = chunk.content
             if isinstance(content, str) and content:
                 if not cur_msg_has_tool:
-                    cur_msg_text.append(content)
                     yield {"type": "text", "content": content}
             elif isinstance(content, list):
                 text = "".join(p.get("text", "") for p in content if isinstance(p, dict))
                 if text and not cur_msg_has_tool:
-                    cur_msg_text.append(text)
                     yield {"type": "text", "content": text}
-
-        #流结束：结算最后一条消息
-        settle_message()
 
         #【第1步·1.4】引用溯源：把本次对话中检索到的来源统一下发，
         #前端在回答气泡下方渲染"参考来源"折叠列表（按 id 去重已在工具侧完成）
@@ -180,13 +189,6 @@ def stream_events(query: str, session_id: str = "", user_id: str = ""):
         #异常只进日志，返回给前端的是友好提示
         logger.error(f"[web]对话流异常：{str(e)}", exc_info=True)
         yield {"type": "error", "content": "服务暂时不可用，请稍后再试。"}
-    else:
-        #【新增】整段对话正常结束才写入记忆：出错或前端中断（GeneratorExit）时不保存，
-        #避免把没有回答的半截对话留给下一轮；无最终回答文本同样不保存
-        if answer_parts and mem_key:
-            memory.append_message(mem_key, "user", query)
-            #多段文本直接拼接为一条助手消息（正常流程只有最终回答这一段）
-            memory.append_message(mem_key, "assistant", "".join(answer_parts))
 
 class LoginRequest(BaseModel):
     user_id: str
@@ -1039,5 +1041,35 @@ if __name__ == "__main__":
 # 验证方式：
 #   启动服务后问一个知识库问题：气泡下方出现"参考来源（N 条）"，展开可见条目明细；
 #   浏览器 DevTools 里可看到 data: {"type":"sources", ...} 事件。
+# ============================================================================================
+
+# ============================================================================================
+# 【第 2 步 · 2.1 说明】会话持久化（本文件的改动说明）
+# --------------------------------------------------------------------------------------------
+# 改动点（共 5 处）：
+#   1. 对话入口由 ReactAgent 换成 agent.orchestration.OrchestratorAgent（编排图）；编排图内部
+#      仍复用既有 ReactAgent 跑日常问答，工具/提示词/中间件一字未动，问答行为零变化。
+#   2. 会话历史不再走进程内 session_memory_service，改由 LangGraph checkpointer 落 SQLite：
+#      thread_id = "用户ID:会话ID"（与原 mem_key 同一个隔离键），进程重启后同一会话可续聊。
+#   3. 本轮只发送新增的那条用户消息（{messages:[{role:user,...}], query}），历史由
+#      checkpointer 在服务端读回并合并——不再每轮重发全量历史。
+#   4. 流式调用改为 agent.graph.stream(..., stream_mode="messages", subgraphs=True,
+#      config={"configurable":{"thread_id":thread_id}})：元组形状变为 (命名空间, (分片, 元数据))；
+#      subgraphs=True 是硬前提（日常问答在子 Agent 中执行，不开收不到逐字分片）。
+#   5. 新增 _SESSION_ID_RE/_safe_session_id：会话ID 格式校验（前端为 crypto.randomUUID）。
+# 为什么保留 sources/tool/tool_done/clear/text 事件语义不变：
+#   第 1 步的引用溯源与前端打字机效果已评测/已验收，本次只换"历史从哪来"，不碰"回答怎么展示"。
+# 边界与兜底：
+#   - session_id 为空或非法（旧前端）→ 用一次性 ephemeral 线程，等价于改造前的无记忆单轮问答；
+#     这些孤立线程不参与续聊，由 scripts/prune_checkpoints.py 定期清理。
+#   - 编译期已知行为差异：用户消息在请求开始即入库，中途出错会在历史里留下一条没有回答的提问
+#     （改造前是整轮不写）。这是 checkpoint 的固有语义，不影响下一轮对话。
+# 与其它文件的关系：
+#   agent/orchestration/{graph,nodes,checkpoint,state}.py 提供图与持久化；
+#   service/session_memory_service.py 已停用（文件保留 + 顶部弃用说明 + 测试防回退）。
+# 验证方式：
+#   1) .venv/Scripts/python.exe -m pytest tests/test_checkpoint_memory.py tests/test_session_memory_deprecated.py
+#   2) 起服务聊两句 → Ctrl+C 重启 → 同一标签页继续问"那键盘呢"，回答应能接上上文；
+#      换账号用同一 session_id 提问，上下文应为空（隔离性）。
 # ============================================================================================
 

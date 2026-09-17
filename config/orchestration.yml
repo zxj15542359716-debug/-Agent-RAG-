@@ -1,0 +1,47 @@
+#编排配置（第2步·编排架构）
+#本文件是第 2 步新增旋钮的唯一去处：路由词表 / checkpoint 落库 / 报告生成 / token 记账。
+#读取方式：utils/config_handler.load_orchestration_config() -> 模块级 orchestration_config
+
+#① 意图路由（2.2 使用）：纯规则判定"报告场景 vs 日常问答"，日常问答零额外 LLM 调用
+router:
+  report_nouns: ["报告"]        #报告类名词
+  #生成类动词：与名词"双条件同时命中"才判为报告场景，挡住"报告一下键盘怎么保养"这类误判
+  report_verbs: ["生成", "出", "写", "整理", "导出", "来一份", "做一份", "给我", "帮我出", "帮我做"]
+  llm_fallback: false           #规则不确定时是否用 LLM 兜底判定（默认关：默认路径永远零额外调用）
+
+#② 会话持久化（2.1 使用）：LangGraph checkpoint 落库，替代原进程内会话记忆
+checkpoint:
+  db_path: data/database/checkpoints.db   #独立库，不塞业务库（见 agent/orchestration/checkpoint.py 说明）
+  max_turns: 10                            #保留最近 N 轮（对齐原 session_memory_service.MAX_TURNS=10）
+
+#③ 报告生成（2.3 使用）：并行子研究者与结构化合成
+report:
+  max_input_tokens: 6000        #合成阶段输入预算（tiktoken 估算），超限触发截断重试
+  finding_max_chars: 1200       #单个研究者结论进入合成提示词时的字符上限
+  max_truncate_attempts: 2      #截断/丢路 重试上限（每次丢信息密度最低的一路）
+  researcher_max_calls: 6       #单个研究者模型调用上限（防结构化输出在模型节点里循环）
+  parallel_limit: 3             #并行研究者并发上限（3 路齐发；调小可降低被限流风险）
+
+#④ token 记账（2.4 使用）：成本账落到 runs / run_nodes / usage_events 三张表
+usage:
+  stream_usage: true            #ChatOpenAI 流式返回 usage（DeepSeek 自定义 base_url 下默认不开）
+  record_dashscope: true        #记录 embedding / rerank 的 DashScope 消耗
+
+# ============================================================================================
+# 【第 2 步 · 2.1 说明】编排配置（config/orchestration.yml）
+# --------------------------------------------------------------------------------------------
+# 为什么单开一个 yml：沿用第 1 步 config/retrieval.yml 的约定——旋钮与代码分离，
+# 调参（路由词表、保留轮数、报告预算、是否记账）不动代码，评测/回归可复跑同一套参数。
+# 各段说明：
+#   ① router：报告场景判定词表。名词与动词"双条件"同时命中才判报告，是为了让
+#      "报告一下键盘的保养方法"这类问法落回日常路径（它想查知识，不是要生成报告）。
+#   ② checkpoint：max_turns=10 与原 session_memory_service.MAX_TURNS 对齐，
+#      保证换实现不换行为（改造前后"最近 10 轮"口径一致，历史消息条数不变）。
+#   ③ report：max_input_tokens 是"合成阶段"的输入预算，超预算按 finding → 引用 逐轮截断，
+#      仍超则按 history→warranty→fault 丢路（信息密度从低到高），最多 max_truncate_attempts 次；
+#      researcher_max_calls 用于遏制"结构化输出反复重试"导致的死循环。
+#   ④ usage：stream_usage 在 DeepSeek（自定义 base_url）下必须显式打开才会随流回 usage，
+#      拿不到时记账会自动降级（记 0 并标注），不影响回答本身。
+# 与其它文件的关系：读取入口 utils/config_handler.load_orchestration_config()；
+# 消费方 agent/orchestration/（checkpoint/router/graph）与 utils/usage_ledger.py。
+# ============================================================================================

@@ -10,6 +10,8 @@ langchain-community==0.4.2
 langchain-openai==1.6.0
 langchain-text-splitters==1.1.2
 langgraph==1.2.11
+#【第2步·2.1】会话持久化：LangGraph 官方 SQLite checkpointer（会带 aiosqlite 与 sqlite-vec 两个依赖）
+langgraph-checkpoint-sqlite==3.1.1
 faiss-cpu==1.15.0
 dashscope==1.27.3
 PyYAML==6.0.3

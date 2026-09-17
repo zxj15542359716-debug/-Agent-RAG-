@@ -58,6 +58,13 @@ def load_retrieval_config(configer_path:str = get_abs_path("config/retrieval.yml
         #全量加载
         return yaml.load(f, Loader=yaml.FullLoader)
 
+#编排配置（第2步·编排架构：路由词表/checkpoint/报告生成/token记账）
+def load_orchestration_config(configer_path:str = get_abs_path("config/orchestration.yml"),encoding:str="utf-8"):
+    #打开config文件
+    with open(configer_path, "r", encoding=encoding) as f:
+        #全量加载
+        return yaml.load(f, Loader=yaml.FullLoader)
+
 rag_config = load_rag_config()
 # 【修改】向量库由 Chroma 更换为 FAISS：模块级配置对象改名 faiss_config
 faiss_config = load_faiss_config()
@@ -65,6 +72,8 @@ prompts_config = load_prompts_config()
 agent_config = load_agent_config()
 # 【第1步·检索纵深】检索参数（mode/召回条数/融合权重/重排），见 config/retrieval.yml
 retrieval_config = load_retrieval_config()
+# 【第2步·编排架构】编排参数（路由词表/checkpoint/报告生成/token记账），见 config/orchestration.yml
+orchestration_config = load_orchestration_config()
 
 if __name__ == '__main__':
     print(rag_config["chat_model_name"])
@@ -79,4 +88,17 @@ if __name__ == '__main__':
 # （实测 keyword 权重 0.7→0.4 使 recall@5 从 0.904 提到 1.000），
 # 配置与代码分离后，调参不动代码、评测脚本可复跑同一套参数。
 # 与前序改动的关系：本文件顶部仍负责 .env 加载（0.4 步）与 require_env 的 fail-fast 校验。
+# ============================================================================================
+
+# ============================================================================================
+# 【第 2 步 · 2.1 说明】本文件在第 2 步的改动（编排配置加载）
+# --------------------------------------------------------------------------------------------
+# 新增 load_orchestration_config() 与模块级 orchestration_config：读取 config/orchestration.yml，
+# 供 agent/orchestration/（checkpoint/router/graph）与 utils/usage_ledger.py 使用：
+#   ① router   意图路由词表（2.2）  ② checkpoint 会话持久化（2.1）
+#   ③ report   并行子研究者与报告预算（2.3）  ④ usage token 记账开关（2.4）
+# 写法完全照抄 load_retrieval_config（同一个函数体、同一套默认路径约定），
+# 保持"配置加载"在本项目里只有一种读法。
+# 为什么配置放 yaml：与第 1 步同理——保留轮数、报告预算、路由词表都是要调参与对比的量，
+# 放进配置后调参不动代码，回归脚本可复跑同一套参数。
 # ============================================================================================
